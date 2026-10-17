@@ -114,11 +114,40 @@ def update_github_repo_homepage(token: str, link: str) -> bool:
     return False
 
 
+WORKER_URL = "https://young-bush-b452.lssfkp01.workers.dev"
+WORKER_SECRET = "b4f97e20b32f48d88e0013916960cbdeec6f081d6f22ea4ca17c469b62fef872"
+
+
+def update_cloudflare_worker(link: str) -> bool:
+    """Aggiorna istantaneamente il Worker Cloudflare con il nuovo URL del tunnel."""
+    try:
+        req_url = f"{WORKER_URL}/update-tunnel?url={urllib.parse.quote(link, safe='')}"
+        req = urllib.request.Request(
+            req_url,
+            headers={
+                "X-Secret": WORKER_SECRET,
+                "User-Agent": "Script2-Tunnel-Sync"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            if resp.status == 200:
+                print(f"[redirect] Cloudflare Worker aggiornato istantaneamente a: {link}")
+                return True
+    except Exception as e:
+        print(f"[redirect] Attenzione: errore aggiornamento Cloudflare Worker: {e}")
+    return False
+
+
 def main():
     if len(sys.argv) < 2:
         print("[redirect] Errore: manca il link come argomento")
         return 1
     link = sys.argv[1].strip()
+
+    # 1. Aggiorna SUBITO il Worker Cloudflare (istantaneo a livello globale)
+    update_cloudflare_worker(link)
+
     token = ""
     if TOKEN_FILE.exists():
         token = TOKEN_FILE.read_text(encoding="utf-8").strip()
@@ -126,10 +155,10 @@ def main():
         print("[redirect] Errore: github_token.txt non trovato")
         return 1
 
-    # 1. Aggiorna subito l'API repo homepage (ha effetto in 0 secondi)
+    # 2. Aggiorna l'API repo homepage su GitHub
     update_github_repo_homepage(token, link)
 
-    # 2. Aggiorna index.html per la copia statica di riserva
+    # 3. Aggiorna index.html per la copia statica di riserva
     INDEX.write_text(TEMPLATE.format(link=link), encoding="utf-8")
 
     repo_url = f"https://x-access-token:{token}@github.com/luishighnest/script.git"
