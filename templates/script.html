@@ -541,6 +541,27 @@
             color: #ff544a !important;
             text-shadow: 0 0 12px rgba(255, 59, 48, 0.35);
         }
+        .badge-method {
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-size: 0.68rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            backdrop-filter: blur(14px) saturate(180%);
+            -webkit-backdrop-filter: blur(14px) saturate(180%);
+        }
+        .badge-method-web {
+            background: rgba(0, 125, 255, 0.12) !important;
+            border: 1px solid rgba(0, 125, 255, 0.3) !important;
+            color: #5ac8fa !important;
+            text-shadow: 0 0 12px rgba(0, 125, 255, 0.35);
+        }
+        .badge-method-mobile {
+            background: rgba(0, 229, 155, 0.12) !important;
+            border: 1px solid rgba(0, 229, 155, 0.3) !important;
+            color: #00e59b !important;
+            text-shadow: 0 0 12px rgba(0, 229, 155, 0.35);
+        }
 
         .now-card-time-ext:has(.dot-pulse) { color: #ff3b30; font-weight: 700; }
 
@@ -740,6 +761,56 @@
         }
         .profile-btn-danger:hover { background: #ff3b30; color: #ffffff; border-color: #ff3b30; }
         .profile-btn:disabled { opacity: .6; }
+        .method-pill-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 6px;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.04);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px) saturate(160%);
+            -webkit-backdrop-filter: blur(10px) saturate(160%);
+        }
+        .method-pill-label {
+            font-size: .68rem;
+            font-weight: 700;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: rgba(255, 255, 255, 0.5);
+            padding: 0 4px;
+        }
+        .method-pill-btn {
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            background: rgba(255, 255, 255, 0.03);
+            color: rgba(255, 255, 255, 0.65);
+            border-radius: 999px;
+            padding: 4px 12px;
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .04em;
+            cursor: pointer;
+            transition: all .15s ease;
+            display: inline-flex;
+            align-items: center;
+        }
+        .method-pill-btn:hover {
+            color: #ffffff;
+            border-color: rgba(255, 255, 255, 0.28);
+            background: rgba(255, 255, 255, 0.08);
+        }
+        .method-pill-btn.active.method-pill-web-active {
+            background: rgba(0, 125, 255, 0.18);
+            border-color: rgba(0, 125, 255, 0.5);
+            color: #5ac8fa;
+            text-shadow: 0 0 10px rgba(0, 125, 255, 0.4);
+        }
+        .method-pill-btn.active.method-pill-mobile-active {
+            background: rgba(0, 229, 155, 0.18);
+            border-color: rgba(0, 229, 155, 0.5);
+            color: #00e59b;
+            text-shadow: 0 0 10px rgba(0, 229, 155, 0.4);
+        }
         .navbar .btn-outline-mini {
             height: 32px;
             min-width: 32px;
@@ -780,6 +851,20 @@
     <div id="toast-container"></div>
 
     <!-- SCHERMATA CARICAMENTO SESSIONE JSON (SE NON ANCORA CONFIGURATO) -->
+    {% if nascondi_zip %}
+    <div id="section-profile-setup" class="container d-none">
+        <div class="auth-card">
+            <div class="text-center mb-4">
+                <i class="fa-solid fa-key fa-3x text-warning mb-2"></i>
+                <h4 class="fw-bold text-white">Accesso DAZN</h4>
+                <p class="text-secondary small">Profilo: <strong id="profile-name-label" class="text-warning">{{ profile_name }}</strong></p>
+            </div>
+            <a href="/test-auth" class="btn btn-dazn w-100 py-2">
+                <i class="fa-solid fa-arrow-right-to-bracket me-2"></i>Vai al login DAZN
+            </a>
+        </div>
+    </div>
+    {% else %}
     <div id="section-profile-setup" class="container d-none">
         <div class="auth-card">
             <div class="text-center mb-4">
@@ -810,6 +895,7 @@
             </form>
         </div>
     </div>
+    {% endif %}
 
     <!-- INTERFACCIA SCRIPT COMPLETA -->
     <div id="section-main" class="d-none">
@@ -817,11 +903,36 @@
             <div class="container py-2">
                 <div class="d-flex flex-column w-100 gap-2">
                     <div class="d-flex flex-wrap align-items-center justify-content-between gap-2">
-                        <a class="navbar-brand fw-bold" href="/script">
-                            <i class="fa-solid fa-play me-2"></i>Script2
-                        </a>
+                        <div class="d-flex align-items-center gap-3">
+                            <a class="navbar-brand fw-bold mb-0" href="/script">
+                                <i class="fa-solid fa-play me-2"></i>Script2
+                            </a>
+                            <div style="background: rgba(255,255,255,0.06); border-radius: 30px; padding: 3px; display: inline-flex; border: 1px solid rgba(255,255,255,0.1);">
+                                <a href="/script" style="padding: 4px 14px; border-radius: 20px; font-size: 0.82rem; font-weight: 600; text-decoration: none; background: #00e59b; color: #04120c;">
+                                    <i class="fa-solid fa-play me-1"></i>DAZN
+                                </a>
+                                <a href="/lba" style="padding: 4px 14px; border-radius: 20px; font-size: 0.82rem; font-weight: 600; text-decoration: none; color: #9ca3af;">
+                                    <i class="fa-solid fa-basketball me-1"></i>LBA TV
+                                </a>
+                                <a href="javascript:void(0)" onclick="openNbaManualModal()" style="padding: 4px 14px; border-radius: 20px; font-size: 0.82rem; font-weight: 600; text-decoration: none; color: #ff544a; border: 1px solid rgba(255,84,74,0.3); background: rgba(200,16,46,0.15);" title="Inserimento manuale / estrazione stream NBA TV">
+                                    <i class="fa-solid fa-basketball me-1"></i>NBA TV
+                                </a>
+                            </div>
+                        </div>
                         <div class="d-flex flex-wrap align-items-center gap-2">
                             <span class="badge bg-secondary me-1"><i class="fa-solid fa-user me-1"></i> <span id="top-profile-badge">{{ profile_name }}</span></span>
+                            <div class="method-pill-group" id="method-pill-group" title="Metodo di estrazione DAZN">
+                                <span class="method-pill-label"><i class="fa-solid fa-layer-group me-1"></i>Metodo</span>
+                                <button type="button" class="method-pill-btn method-pill-web active" data-method="web" onclick="changeExtractionMethod('web')">
+                                    <i class="fa-solid fa-globe me-1"></i>Web
+                                </button>
+                                <button type="button" class="method-pill-btn method-pill-mobile" data-method="mobile" onclick="changeExtractionMethod('mobile')">
+                                    <i class="fa-solid fa-mobile-screen-button me-1"></i>Mobile
+                                </button>
+                            </div>
+                            <a href="/lba-auth" class="btn btn-sm btn-outline-mini text-warning border-warning" title="Accesso Account LBA TV">
+                                <i class="fa-solid fa-basketball me-1"></i> LBA TV
+                            </a>
                             <a href="/playlist.m3u" target="_blank" class="btn btn-sm btn-outline-mini" title="Scarica playlist M3U">
                                 <i class="fa-solid fa-download me-1"></i> M3U
                             </a>
@@ -848,12 +959,20 @@
                             <button class="profile-btn profile-btn-success" onclick="manualRefreshDaznSession()" id="btn-refresh-session" title="Forza il rinnovo immediato del token di sessione DAZN">
                                 <i class="fa-solid fa-arrows-rotate"></i> Aggiorna Sessione DAZN
                             </button>
+                            {% if not nascondi_zip %}
                             <button class="profile-btn" onclick="showZipSetup()" title="Carica il file chrome_profile.zip del profilo">
                                 <i class="fa-solid fa-upload"></i> Carica file ZIP
                             </button>
+                            {% endif %}
+                            {% if nascondi_zip %}
+                            <button class="profile-btn profile-btn-success" onclick="window.location.href='/test-auth'" title="Vai al login DAZN">
+                                <i class="fa-solid fa-arrow-right-to-bracket"></i> Login
+                            </button>
+                            {% else %}
                             <button class="profile-btn profile-btn-danger" onclick="deleteProfileSession()" title="Elimina la sessione JSON salvata per questo profilo">
                                 <i class="fa-solid fa-trash"></i> Elimina Sessione
                             </button>
+                            {% endif %}
                         </div>
                     </div>
                 </div>
@@ -891,8 +1010,10 @@
                 </ul>
 
                 <!-- Pulsanti Azione Rapida Eventi Estratti -->
-                <div id="events-actions-bar" class="d-flex gap-2">
-
+                <div id="events-actions-bar" class="d-flex flex-wrap gap-2 align-items-center">
+                    <button class="btn btn-sm btn-outline-info" id="btn-toggle-worker" onclick="toggleWorkerOption()" title="Attiva o disattiva l'estrazione della 3ª opzione con Worker Cloudflare">
+                        <i class="fa-solid fa-cloud me-1"></i> Worker: <span id="worker-status-text">OFF</span>
+                    </button>
                     <button class="btn btn-sm btn-warning" onclick="openEventPool()" title="Unisce gli eventi delle due fonti (menu Pz8, tasti 3 e 4) e permette di scegliere quale canale MPD inserire">
                         <i class="fa-solid fa-layer-group me-1"></i> Aggiungi eventi
                     </button>
@@ -1044,14 +1165,25 @@
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-const modal = new bootstrap.Modal(document.getElementById('extractModal'));
+        const modal = new bootstrap.Modal(document.getElementById('extractModal'));
         let hasFolder = {{ 'true' if chrome_profile_set else 'false' }};
+        const TEST_PROFILE = {{ 'true' if nascondi_zip else 'false' }};
 
         function init() {
+            {% if nascondi_zip %}
+            // Profilo TEST: si resta sempre sull'interfaccia principale, con il
+            // tasto Login in alto per andare a fare l'accesso DAZN.
+            {% endif %}
             showMain();
         }
 
-function showZipSetup(reasonText) {
+        function showZipSetup(reasonText) {
+            {% if nascondi_zip %}
+            // Per il profilo TEST non esiste il pannello zip: qualsiasi richiesta
+            // di "carica il profilo" diventa un invito a fare il login diretto.
+            window.location.href = '/test-auth';
+            return;
+            {% endif %}
             document.getElementById('section-profile-setup').classList.remove('d-none');
             document.getElementById('section-main').classList.add('d-none');
             document.getElementById('input-zip').value = "";
@@ -1200,8 +1332,10 @@ function showZipSetup(reasonText) {
             if (_expCache.has(mpd)) return _expCache.get(mpd);
             let result = null;
             try {
+                let raw = String(mpd);
+                try { raw = decodeURIComponent(raw); } catch (e) {}
                 // Tollera 2 o 3 segmenti e payload non vuoto
-                const m = String(mpd).match(/@(eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)/);
+                const m = raw.match(/@(eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+)/);
                 if (m) {
                     const claims = _b64urlToJson(m[1].split('.')[1] || '');
                     if (claims && claims.exp) result = claims.exp * 1000;
@@ -1306,11 +1440,16 @@ function showZipSetup(reasonText) {
                             key: keys,
                             ua: ua
                         };
+                        // Include method SOLO se presente originariamente e se flusso DAZN
+                        if (ev.method && (mpd.includes("indazn.com") || mpd.includes("dazn"))) {
+                            itemObj.method = String(ev.method).toLowerCase();
+                        }
                         cleanData[comp].push(itemObj);
                         entries.push({ comp, idx, extUrl, itemObj });
                     });
                 }
 
+                window.__cleanData = cleanData;
                 document.getElementById('count-extracted').innerText = entries.length;
 
                 if (entries.length === 0) {
@@ -1349,12 +1488,15 @@ function showZipSetup(reasonText) {
                                         <button class="btn btn-outline-mini extracted-action" data-comp="${encodeURIComponent(comp)}" data-idx="${idx}" data-name="${encodeURIComponent(itemObj.name)}" onclick="openRenameModal(this)" title="Rinomina">
                                             <i class="fa-solid fa-pen"></i>
                                         </button>
-                                        <button class="btn btn-outline-mini extracted-action" data-comp="${encodeURIComponent(comp)}" data-idx="${idx}" onclick="deleteEvent(this)" title="Elimina">
+                                        <button class="btn btn-outline-mini extracted-action" data-comp="${encodeURIComponent(comp)}" data-idx="${idx}" data-name="${encodeURIComponent(itemObj.name)}" onclick="deleteEvent(this)" title="Elimina">
                                             <i class="fa-solid fa-trash"></i>
                                         </button>
                                     </div>
                                 </div>
-                                <div class="badge-extracted mb-2"><i class="fa-solid fa-check me-1"></i>${comp}</div>
+                                <div class="d-flex flex-wrap gap-1 mb-2">
+                            <div class="badge-extracted"><i class="fa-solid fa-check me-1"></i>${comp}</div>
+                            ${methodBadge(itemObj)}
+                        </div>
                                 <div class="stream-exp small mt-1 mb-2 ${expMs ? 'text-success' : 'text-muted'}" data-exp="${expMs || ''}">
                                     <i class="fa-solid fa-hourglass-half me-1"></i>Flusso scade tra <span class="stream-exp-countdown fw-semibold">${expMs ? '…' : 'n/d'}</span>
                                 </div>
@@ -1372,13 +1514,101 @@ function showZipSetup(reasonText) {
 
                 // JSON Completo = identico, byte per byte, alla risposta dell'API /api/events
                 window.__eventsJson = rawJson;
+                checkWorkerOptionStatus();
+                checkExtractionMethod();
             } catch (err) {
                 console.error(err);
                 document.getElementById('extracted-container').innerHTML = `<div class="col-12 text-danger text-center">Errore nel caricamento: ${err.message}</div>`;
             }
         }
 
+        async function checkWorkerOptionStatus() {
+            try {
+                const res = await fetch('/api/worker-option');
+                const data = await res.json();
+                updateWorkerButtonUI(!!data.enabled);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        function updateMethodPills(method) {
+            const group = document.getElementById('method-pill-group');
+            if (!group) return;
+            const m = (method === 'mobile') ? 'mobile' : 'web';
+            group.querySelectorAll('.method-pill-btn').forEach(btn => {
+                const active = btn.getAttribute('data-method') === m;
+                btn.classList.toggle('active', active);
+                btn.classList.toggle('method-pill-web-active', active && m === 'web');
+                btn.classList.toggle('method-pill-mobile-active', active && m === 'mobile');
+            });
+        }
+
+        async function checkExtractionMethod() {
+            try {
+                const res = await fetch('/api/extraction-method');
+                if (!res.ok) return;
+                const data = await res.json();
+                updateMethodPills(data.method);
+            } catch (e) {
+                console.error(e);
+            }
+        }
+
+        async function changeExtractionMethod(method) {
+            try {
+                const res = await fetch('/api/extraction-method', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ method })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.ok) throw new Error(data.error || 'Errore');
+                updateMethodPills(data.method);
+                showToast(data.method === 'mobile'
+                    ? 'Metodo estrazione: MOBILE (Platform=android, 1080p)'
+                    : 'Metodo estrazione: WEB (Platform=web, 1080p)');
+            } catch (e) {
+                showToast('Errore cambio metodo: ' + e.message, true);
+                checkExtractionMethod();
+            }
+        }
+
+        function updateWorkerButtonUI(enabled) {
+            const btn = document.getElementById('btn-toggle-worker');
+            const txt = document.getElementById('worker-status-text');
+            if (!btn || !txt) return;
+            if (enabled) {
+                btn.className = 'btn btn-sm btn-info text-dark fw-bold';
+                txt.textContent = 'ON';
+            } else {
+                btn.className = 'btn btn-sm btn-outline-info';
+                txt.textContent = 'OFF';
+            }
+        }
+
+        async function toggleWorkerOption() {
+            try {
+                const curTxt = document.getElementById('worker-status-text')?.textContent || 'OFF';
+                const nextState = curTxt !== 'ON';
+                const res = await fetch('/api/worker-option', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: nextState })
+                });
+                const data = await res.json();
+                updateWorkerButtonUI(!!data.enabled);
+                showToast(data.enabled ? "3ª opzione Worker ATTIVATA per l'estrazione" : "3ª opzione Worker DISATTIVATA");
+            } catch (e) {
+                showToast("Errore cambio opzione worker: " + e.message, true);
+            }
+        }
+
         function copyAllJson() {
+            if (window.__cleanData) {
+                copyText(JSON.stringify(window.__cleanData, null, 3), "JSON completo copiato!");
+                return;
+            }
             const fullJson = window.__eventsJson || '';
             if (fullJson && fullJson !== 'Nessun evento...') {
                 copyText(fullJson, "JSON completo copiato!");
@@ -1426,6 +1656,7 @@ function showZipSetup(reasonText) {
         async function deleteEvent(el) {
             const comp = decodeURIComponent(el.getAttribute('data-comp') || '');
             const index = parseInt(el.getAttribute('data-idx') || '0', 10);
+            const name = decodeURIComponent(el.getAttribute('data-name') || '');
             const card = el.closest('.poster-col');
             if (card) {
                 card.style.opacity = '0.35';
@@ -1436,7 +1667,7 @@ function showZipSetup(reasonText) {
                 const res = await fetch('/api/events/delete', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ comp, index })
+                    body: JSON.stringify({ comp, index, name })
                 });
                 const data = await res.json();
                 if (data.ok) {
@@ -1977,7 +2208,13 @@ function showZipSetup(reasonText) {
 
         async function extractItem(id, asset_id, encodedTitle, encodedImage = '', encodedComp = '', encodedStart = '', encodedEnd = '') {
             if (!hasFolder) {
+                {% if nascondi_zip %}
+                // Profilo TEST: l'autenticazione e' con email e password, non con un
+                // profilo browser. Se manca il token si va a fare il login diretto.
+                window.location.href = '/test-auth';
+                {% else %}
                 showZipSetup("Per estrarre devi prima caricare il file chrome_profile.zip di questo profilo. Caricalo qui sotto, poi riprova l'estrazione.");
+                {% endif %}
                 return;
             }
             const title = decodeURIComponent(encodedTitle);
@@ -2074,6 +2311,17 @@ function showCopyToast(msg, isError) {
             }
         }
 
+        function methodBadge(itemObj) {
+            if (!itemObj || !itemObj.method) return '';
+            const m = String(itemObj.method).toLowerCase();
+            if (m === 'mobile') {
+                return '<span class="badge-method badge-method-mobile" title="Estratto con metodo Mobile (Platform=android, 1080p)"><i class="fa-solid fa-mobile-screen-button me-1"></i>Mobile</span>';
+            } else if (m === 'web') {
+                return '<span class="badge-method badge-method-web" title="Estratto con metodo Web (Platform=web, 1080p)"><i class="fa-solid fa-globe me-1"></i>Web</span>';
+            }
+            return '';
+        }
+
         function copyEntry(index, field, msg) {
             const entry = window.__extractedEntries[index];
             if (!entry || !entry[field]) {
@@ -2164,5 +2412,98 @@ function showCopyToast(msg, isError) {
         tickStreamExpiry();
         startStreamExpiryTicker();
     </script>
+
+<!-- Modal NBA Manual Push -->
+<div class="modal fade" id="nbaManualModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-lg">
+        <div class="modal-content" style="background-color: #111318; border: 1px solid rgba(255,255,255,0.12); color: #fff;">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title"><i class="fa-solid fa-basketball text-danger me-2"></i>Estrazione Manuale NBA (Bash Curl)</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-dark border-secondary small mb-3">
+                    Incolla qui direttamente i comandi <strong>cURL (bash)</strong> copiati da DevTools (Network tab -&gt; Copy as cURL bash) per il manifest e per la licenza Widevine. Lo script estrarrà automaticamente token, cookie, PSSH e chiave Widevine, pubblicando su Kodi e Upstash.
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold text-white small">1. Titolo Evento</label>
+                    <input type="text" class="form-control bg-dark text-white border-secondary" id="nba-manual-title" placeholder="Es. Pacers vs Sixers">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold text-white small">2. cURL Manifest HLS / MPD (bash copiato)</label>
+                    <textarea class="form-control bg-dark text-white border-secondary font-monospace small" id="nba-manual-mpd" rows="4" placeholder="curl --url 'https://lpnba.akamaized.net/live-pz/p/hls-wvpr/.../index.m3u8' ..."></textarea>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label fw-bold text-white small">3. cURL Licenza Widevine (bash copiato)</label>
+                    <textarea class="form-control bg-dark text-white border-secondary font-monospace small" id="nba-manual-lic" rows="4" placeholder="curl --url 'https://ottapp-appgw-amp.nba.com/v1/client/get-widevine-license?...' ..."></textarea>
+                </div>
+                <div id="nba-manual-status" class="mt-2"></div>
+            </div>
+            <div class="modal-footer border-secondary">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Chiudi</button>
+                <button type="button" class="btn btn-danger" id="btn-nba-manual-extract" onclick="executeNbaManualPush()">
+                    <i class="fa-solid fa-bolt me-1"></i>Estrai e Pubblica
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+function openNbaManualModal() {
+    document.getElementById('nba-manual-status').innerHTML = '';
+    const m = new bootstrap.Modal(document.getElementById('nbaManualModal'));
+    m.show();
+}
+
+async function executeNbaManualPush() {
+    const title = document.getElementById('nba-manual-title').value.trim() || 'NBA Stream';
+    const curlMpd = document.getElementById('nba-manual-mpd').value.trim();
+    const curlLic = document.getElementById('nba-manual-lic').value.trim();
+    const statusDiv = document.getElementById('nba-manual-status');
+    const btn = document.getElementById('btn-nba-manual-extract');
+
+    if (!curlMpd || !curlLic) {
+        statusDiv.innerHTML = '<div class="alert alert-warning py-2 small">Compila sia il campo Manifest che quello della Licenza!</div>';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Estrazione in corso...';
+    statusDiv.innerHTML = '<div class="alert alert-info py-2 small"><i class="fa-solid fa-spinner fa-spin me-2"></i>Scaricamento manifest, estrazione PSSH e richiesta licenza Widevine in corso...</div>';
+
+    try {
+        const resp = await fetch('/api/nba/manual-push', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                title: title,
+                curl_mpd: curlMpd,
+                curl_lic: curlLic
+            })
+        });
+        let res;
+        const textResp = await resp.text();
+        try {
+            res = JSON.parse(textResp);
+        } catch(e) {
+            statusDiv.innerHTML = '<div class="alert alert-danger py-2 small"><i class="fa-solid fa-triangle-exclamation me-2"></i>Errore dal server (HTTP ' + resp.status + '): ' + (textResp.substring(0, 250) || 'Risposta vuota') + '</div>';
+            return;
+        }
+        if (res.ok) {
+            statusDiv.innerHTML = '<div class="alert alert-success py-2 small"><i class="fa-solid fa-check me-2"></i><strong>Completato!</strong> Chiave estratta: <code class="text-dark bg-light px-1">' + res.event.key + '</code><br>Evento salvato e sincronizzato su Upstash / Kodi!</div>';
+            if (typeof caricaDati === 'function') caricaDati();
+        } else {
+            statusDiv.innerHTML = '<div class="alert alert-danger py-2 small"><i class="fa-solid fa-triangle-exclamation me-2"></i>Errore: ' + (res.errore || 'Fallito') + '</div>';
+        }
+    } catch(err) {
+        statusDiv.innerHTML = '<div class="alert alert-danger py-2 small">Errore di rete: ' + err.message + '</div>';
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fa-solid fa-bolt me-1"></i>Estrai e Pubblica';
+    }
+}
+</script>
+
 </body>
 </html>

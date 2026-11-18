@@ -10,7 +10,10 @@ DEFAULT_CONFIG = {
     "extraction_engine": "curl_cffi",
     "include_ua_curl": True,
     "include_ua_headless": True,
+    "extraction_method": "web",
 }
+
+EXTRACTION_METHODS = ("web", "mobile")
 
 def load_config():
     if CONFIG_FILE.exists():
@@ -44,3 +47,20 @@ def toggle_setting(key):
     cfg[key] = not cfg.get(key, DEFAULT_CONFIG.get(key, False))
     save_config(cfg)
     return cfg[key]
+
+
+def get_extraction_method():
+    """Metodo di estrazione attivo: "web" (default) oppure "mobile"."""
+    method = str(get_setting("extraction_method") or "web").strip().lower()
+    return method if method in EXTRACTION_METHODS else "web"
+
+
+def set_extraction_method(method):
+    """Salva il metodo di estrazione. Valori ammessi: web, mobile."""
+    method = str(method or "").strip().lower()
+    if method not in EXTRACTION_METHODS:
+        raise ValueError("Metodo di estrazione non valido")
+    cfg = load_config()
+    cfg["extraction_method"] = method
+    save_config(cfg)
+    return method

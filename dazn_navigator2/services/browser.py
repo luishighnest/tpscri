@@ -1,8 +1,10 @@
-import asyncio, json, os, subprocess, sys
+import asyncio, json, os, shutil, subprocess, sys, threading
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 CDP_PORT = 9222
+# Lock globale tra thread: impedisce lanci concorrenti di Chrome
+_BROWSER_THREAD_LOCK = threading.Lock()
 
 _current_profile_dir = BASE_DIR / "saved_profiles" / "profile_mpd" / "chrome_profile"
 
@@ -36,16 +38,24 @@ class BrowserManager:
 
     async def start(self, user_data_dir: Path = None):
         from playwright.async_api import async_playwright
-        self._playwright = await async_playwright().start()
-        
         p_dir = Path(user_data_dir) if user_data_dir else Path(get_active_profile_dir())
         p_dir.mkdir(parents=True, exist_ok=True)
+        # Pulizia Crashpad corrotto
+        for _cp in (p_dir / "Crashpad",):
+            try:
+                if _cp.exists():
+                    shutil.rmtree(_cp, ignore_errors=True)
+            except Exception:
+                pass
+        self._playwright = await async_playwright().start()
         self._user_data_dir = p_dir
 
         launch_args = [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
+            '--disable-crash-reporter',
+            '--disable-breakpad',
             '--disable-blink-features=AutomationControlled',
             '--no-first-run'
         ]
@@ -89,6 +99,13 @@ class BrowserManager:
     async def _try_connect_cdp(self):
         try:
             browser = await self._playwright.chromium.connect_over_cdp(f'http://127.0.0.1:{CDP_PORT}')
+            # Verifica che il browser sia davvero vivo e abbia contesti
+            if not browser or not browser.contexts:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                return None
             return browser
         except Exception:
             return None
@@ -96,20 +113,48 @@ class BrowserManager:
     async def _launch_chrome(self, profile_dir: Path):
         chrome_bin = "chromium"
         if sys.platform == "win32":
-            chrome_bin = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-            if not os.path.exists(chrome_bin):
-                chrome_bin = "msedge"
+            candidati = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            ]
+            chrome_bin = None
+            for c in candidati:
+                if os.path.exists(c):
+                    chrome_bin = c
+                    break
+            if not chrome_bin:
+                chrome_bin = "chrome"
         try:
+            # Rimuovi Crashpad corrotto (causa "Settings version is not 1")
+            for _cp in (Path(profile_dir) / "Crashpad", Path(profile_dir) / "chrome_profile" / "Crashpad"):
+                try:
+                    if _cp.exists():
+                        shutil.rmtree(_cp, ignore_errors=True)
+                except Exception:
+                    pass
+            # Uccidi eventuali Chrome zombie sulla porta 9222 prima di lanciare
+            try:
+                no_win_kill = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'chrome|msedge' -and $_.CommandLine -match 'remote-debugging-port=9222' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+                    creationflags=no_win_kill, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+                )
+            except Exception:
+                pass
             no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
             subprocess.Popen(
                 [chrome_bin, '--headless=new', f'--remote-debugging-port={CDP_PORT}',
                  f'--user-data-dir={profile_dir}', '--no-first-run', '--no-sandbox',
+                 '--disable-crash-reporter', '--disable-breakpad',
                  '--log-level=3', '--disable-logging',
                  '--disable-blink-features=AutomationControlled', 'about:blank'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=no_win
             )
-            for _ in range(20):
+            for _ in range(30):
                 await asyncio.sleep(1)
                 browser = await self._try_connect_cdp()
                 if browser:
@@ -280,12 +325,25 @@ async def get_browser(user_data_dir: Path = None) -> BrowserManager:
         if _browser_instance is None:
             inst = BrowserManager()
             try:
-                await inst.start(user_data_dir=user_data_dir)
+                with _BROWSER_THREAD_LOCK:
+                    await inst.start(user_data_dir=user_data_dir)
             except Exception:
                 # Un'istanza mezza avviata (contesto None) farebbe fallire
                 # ogni richiesta successiva: si butta via e si ripropora' dopo.
                 try:
                     await inst.close()
+                except Exception:
+                    pass
+                _browser_instance = None
+                # Se è rimasto un processo zombie su porta CDP 9222 o msedge headless bloccato,
+                # pulisci solo i processi orfani headless per sbloccare la porta e i file del profilo
+                try:
+                    no_win = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                    subprocess.run(
+                        ["powershell", "-NoProfile", "-Command",
+                         "Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'msedge|chrome' -and $_.CommandLine -match 'remote-debugging-port' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+                        creationflags=no_win, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+                    )
                 except Exception:
                     pass
                 raise

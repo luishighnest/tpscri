@@ -4,13 +4,8 @@ import sys, json, re, asyncio, subprocess, base64, os, uuid as _uuid, time, thre
 
 from pathlib import Path
 
-try:
-    from playwright.async_api import async_playwright
-except Exception:
-    # Playwright non disponibile (es. Termux/Android): il server parte lo stesso,
-    # le estrazioni useranno la via veloce curl_cffi e il browser servera' solo
-    # quando installato.
-    async_playwright = None
+# Playwright e' importato in modo pigro (vedi services/browser.py) per evitare
+# effetti collaterali sul loop asyncio / threading del server Flask.
 from rich.console import Console
 
 console = Console(safe_box=True, highlight=False)
@@ -55,6 +50,7 @@ DEVICE_ID_FILE = Path(__file__).resolve().parent.parent.parent / "saved_profiles
 
 # Sessione HTTP globale persistente con connection pooling
 _GLOBAL_SESSION = None
+_GLOBAL_SESSION_IMPERSONATE = None
 
 # ─── Velocita': quanto token resta considerato "buono" ────────────────────
 # Sotto TOKEN_MIN_LIFE_S il token e' scaduto o in scadenza: si passa dal
@@ -113,6 +109,10 @@ ANDROID_PLAYER_UA = (
     "(KHTML, like Gecko) Version/4.0 Chrome/131.0.6778.135 Mobile Safari/537.36"
 )
 
+# Profilo TLS mobile: la Playback API con Platform=android risponde 403
+# CloudFront se la richiesta parte con il TLS desktop.
+MOBILE_IMPERSONATE = "chrome131_android"
+
 
 def _valid_browser_ua(ua: str) -> bool:
     """True se la stringa e' un User-Agent di browser (non Kodi, non vuoto)."""
@@ -143,6 +143,27 @@ def get_impersonate() -> str:
     if allowed:
         return DEFAULT_IMPERSONATE if DEFAULT_IMPERSONATE in allowed else imp
     return imp
+
+
+def get_extraction_impersonate(method: str = None) -> str:
+    """Profilo TLS effettivo in base al metodo di estrazione scelto.
+
+    "web"    -> preferred_impersonate della config (comportamento storico)
+    "mobile" -> chrome131_android, indispensabile per Platform=android
+    """
+    from dazn_navigator2.settings import get_extraction_method
+    method = (method or get_extraction_method()).strip().lower()
+    if method == "mobile":
+        try:
+            from curl_cffi.requests.impersonate import BrowserType
+            if MOBILE_IMPERSONATE in {b.value for b in BrowserType}:
+                return MOBILE_IMPERSONATE
+        except Exception:
+            pass
+        # Se curl_cffi non conosce il profilo mobile si prova comunque: meglio
+        # un errore esplicito della Playback API che un 403 silenzioso.
+        return MOBILE_IMPERSONATE
+    return get_impersonate()
 
 
 def _probe_user_agent_sync(impersonate: str = None) -> str:
@@ -275,7 +296,7 @@ def _cdn_headers(ua: str, dazn_token: str = "") -> dict:
     return h
 
 
-def validate_cdn_user_agent(mpd_url: str, dazn_token: str = "", candidates=None) -> str:
+def validate_cdn_user_agent(mpd_url: str, dazn_token: str = "", candidates=None, impersonate=None) -> str:
     """Verifica quale User-Agent e' realmente accettato dalla CDN per questo MPD.
 
     Il token e' legato all'UA della richiesta Playback: si testano i candidati e
@@ -288,7 +309,7 @@ def validate_cdn_user_agent(mpd_url: str, dazn_token: str = "", candidates=None)
         cands = [c for c in (candidates if candidates is not None else ua_candidates()) if c]
         for ua in cands:
             try:
-                s = creq.Session(impersonate=get_impersonate())
+                s = creq.Session(impersonate=impersonate or get_impersonate())
                 try:
                     r = s.get(mpd_url, headers=_cdn_headers(ua, dazn_token), timeout=8)
                 finally:
@@ -314,18 +335,45 @@ _CACHED_SERVICES = {
     "ContentItem": "https://contentitem.discovery.indazn.com/eu/v1/contentitem",
     "Event": "https://event.discovery.indazn.com/eu/v1/event"
 }
+
+# CDM Widevine caricato una sola volta dal .wvd e poi riusato da ogni estrazione.
+# Senza questa dichiarazione la riga "global _CACHED_CDM" non crea la variabile
+# e la prima lettura (_CACHED_CDM is None) termina con NameError.
 _CACHED_CDM = None
 
-async def _get_http_session():
-    global _GLOBAL_SESSION
+
+async def _reset_http_session():
+    global _GLOBAL_SESSION, _GLOBAL_SESSION_IMPERSONATE
+    if _GLOBAL_SESSION is not None:
+        try:
+            await _GLOBAL_SESSION.close()
+        except Exception:
+            pass
+        _GLOBAL_SESSION = None
+    _GLOBAL_SESSION_IMPERSONATE = None
+
+async def _get_http_session(impersonate=None):
+    global _GLOBAL_SESSION, _GLOBAL_SESSION_IMPERSONATE
+    imp = impersonate or get_extraction_impersonate()
     try:
         cur_loop = asyncio.get_running_loop()
     except RuntimeError:
         cur_loop = None
     sess_loop = getattr(_GLOBAL_SESSION, "_loop", None)
-    if _GLOBAL_SESSION is None or (cur_loop is not None and sess_loop is not None and sess_loop != cur_loop):
+    need_new = (
+        _GLOBAL_SESSION is None
+        or _GLOBAL_SESSION_IMPERSONATE != imp
+        or (cur_loop is not None and sess_loop is not None and sess_loop != cur_loop)
+    )
+    if need_new:
+        if _GLOBAL_SESSION is not None:
+            try:
+                await _GLOBAL_SESSION.close()
+            except Exception:
+                pass
         from curl_cffi.requests import AsyncSession
-        _GLOBAL_SESSION = AsyncSession(impersonate=get_impersonate())
+        _GLOBAL_SESSION = AsyncSession(impersonate=imp)
+        _GLOBAL_SESSION_IMPERSONATE = imp
     return _GLOBAL_SESSION
 
 class HeadlessExtractor:
@@ -464,6 +512,8 @@ class HeadlessExtractor:
         from dazn_navigator2.services.browser import get_browser, set_active_profile_dir
         from dazn_navigator2.settings import get_setting
         target_p = Path(profile_dir) if profile_dir else None
+        if target_p and (target_p / "chrome_profile").exists():
+            target_p = target_p / "chrome_profile"
         self._profile_dir = target_p
         self._browser_used = False
         if target_p:
@@ -605,7 +655,7 @@ class HeadlessExtractor:
         return (b.page if b else None), jwt
 
 
-    async def _chiama_api(self, url, jwt, method="GET", body_obj=None, page=None, cdn_token=None):
+    async def _chiama_api(self, url, jwt, method="GET", body_obj=None, page=None, cdn_token=None, user_agent=None, impersonate=None):
         import json
         from dazn_navigator2.settings import get_setting
         engine = get_setting("extraction_engine")
@@ -619,8 +669,13 @@ class HeadlessExtractor:
             "content-type": "application/json",
             "accept": "*/*",
         }
+        if user_agent:
+            headers["user-agent"] = user_agent
         
-        if engine == "headless" and page:
+        # Il percorso headless usa il TLS del browser (desktop): con
+        # Platform=android la Playback API risponde 403 CloudFront. In quel
+        # caso si forza curl_cffi con il profilo TLS mobile.
+        if engine == "headless" and page and not impersonate:
             try:
                 clean_hdrs = dict(headers)
                 clean_hdrs.pop("origin", None)
@@ -638,7 +693,7 @@ class HeadlessExtractor:
         # Modalità Veloce (curl_cffi con Sessione persistente)
         try:
             from curl_cffi.requests import AsyncSession
-            client = await _get_http_session()
+            client = await _get_http_session(impersonate=impersonate)
             if method == "POST":
                 resp = await client.post(url, headers=headers, json=body_obj, timeout=10)
             else:
@@ -674,6 +729,7 @@ class HeadlessExtractor:
                     pass
             return {"ok": False, "status": resp.status_code, "body": resp.text}
         except Exception as e:
+            await _reset_http_session()
             if page:
                 try:
                     js_code = """
@@ -732,9 +788,15 @@ class HeadlessExtractor:
                     if status is None:
                         status = getattr(resp, "status_code", 0)
                     if status == 200:
-                        body = await resp.body() if hasattr(resp, "body") else resp.content
+                        if hasattr(resp, "body"):
+                            body = await resp.body() if callable(resp.body) else resp.body
+                        else:
+                            body = resp.content
                         return {"ok": True, "body": _b64.b64encode(body).decode("ascii")}
-                    text = await resp.text() if hasattr(resp, "text") else ""
+                    if hasattr(resp, "text"):
+                        text = (await resp.text()) if callable(resp.text) else resp.text
+                    else:
+                        text = ""
                     hdrs = dict(getattr(resp, "headers", {}) or {})
                     last = {"ok": False, "status": status, "bodyText": text, "headers": hdrs,
                             "browser_res": last}
@@ -804,9 +866,10 @@ class HeadlessExtractor:
         if dev_id:
             dev_id = dev_id.split("|")[0].strip()
 
-        from dazn_navigator2.settings import get_setting
-        mfr = (get_setting("playback_manufacturer") or "web").lower()
-        if mfr in ("samsung", "android"):
+        from dazn_navigator2.settings import get_setting, get_extraction_method
+        extraction_method = get_extraction_method()
+        is_mobile = extraction_method == "mobile"
+        if is_mobile:
             platform_param = "android"
             player_id_param = "%40dazn%2Fpeng-android%2Fandroid"
             model_param = "SM-A137F"
@@ -818,17 +881,19 @@ class HeadlessExtractor:
             mfr_param = "Web"
 
         playback_svc = "https://api.playback.indazn.com/v5/Playback"
-        console.print(f"[dim]  -> Playback endpoint: {playback_svc}[/dim]")
+        console.print(f"[dim]  -> Playback endpoint: {playback_svc} (metodo={extraction_method})[/dim]")
         _t = time.time()
         sid = f"{int(time.time()*1000)}-{dev_id}-{asset_id}-{_uuid.uuid4().hex[:8].upper()}"
         pb_url = (f"{playback_svc}?AppVersion=2.85.0&DrmType=WIDEVINE&Format=MPEG-DASH"
-                  f"&PlayerId=%40dazn%2Fpeng-html5-core%2Fweb%2Fweb&Platform=web&Model=Desktop"
-                  f"&Secure=true&Manufacturer=Web&PlayReadyInitiator=false&Capabilities=mta"
+                  f"&PlayerId={player_id_param}&Platform={platform_param}&Model={model_param}"
+                  f"&Secure=true&Manufacturer={mfr_param}&PlayReadyInitiator=false&Capabilities=mta"
                   f"&AssetId={asset_id}&LanguageCode=it&country=it&CountryCode=it")
 
-        web_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        web_ua = ANDROID_PLAYER_UA if is_mobile else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        playback_ua = ANDROID_PLAYER_UA if is_mobile else None
+        pb_impersonate = MOBILE_IMPERSONATE if is_mobile else None
 
-        pb_r = await self._chiama_api(pb_url, jwt, page=page)
+        pb_r = await self._chiama_api(pb_url, jwt, page=page, user_agent=playback_ua, impersonate=pb_impersonate)
 
         console.print(f"[dim]  -> 3. Playback API: {time.time() - _t:.2f}s[/dim]")
 
@@ -855,15 +920,10 @@ class HeadlessExtractor:
                         if match and match.get("AssetId") != asset_id:
                             fb_aid = match.get("AssetId")
                             console.print(f"[dim]  -> Fallback su evento Live attivo: {match.get('Title')} ({fb_aid})[/dim]")
-                            fb_url = f"{playback_svc}?AppVersion=0.149.9&DrmType=WIDEVINE&Format=MPEG-DASH&PlayerId=%40dazn%2Fpeng-html5-core%2Fweb%2Fweb&Platform=web&Model=unknown&Secure=true&Manufacturer=Web&PlayReadyInitiator=false&Capabilities=mta&AssetId={fb_aid}&LanguageCode=it&country=it&CountryCode=it"
-                            r_fb_req = await page.request.get(fb_url, headers={
-                                "authorization": f"Bearer {jwt}",
-                                "dazn-token": jwt,
-                                "x-dazn-device": dev_id,
-                                "user-agent": web_ua
-                            })
-                            if r_fb_req.ok:
-                                pb_r = {"ok": True, "status": r_fb_req.status, "body": await r_fb_req.text()}
+                            fb_url = f"{playback_svc}?AppVersion=0.149.9&DrmType=WIDEVINE&Format=MPEG-DASH&PlayerId={player_id_param}&Platform={platform_param}&Model={model_param}&Secure=true&Manufacturer={mfr_param}&PlayReadyInitiator=false&Capabilities=mta&AssetId={fb_aid}&LanguageCode=it&country=it&CountryCode=it"
+                            r_fb_req = await self._chiama_api(fb_url, jwt, page=page, user_agent=web_ua, impersonate=pb_impersonate)
+                            if r_fb_req.get("ok"):
+                                pb_r = {"ok": True, "status": r_fb_req.get("status"), "body": r_fb_req.get("body", "")}
                                 found_fallback = True
             except Exception:
                 pass
@@ -890,6 +950,24 @@ class HeadlessExtractor:
             self.result["error"] = "Nessun PlaybackDetails nella risposta."
             return self.result
 
+        # Platform=android restituisce il profilo "mob25f" (max 720p / ~3 Mbps).
+        # Il token CDN non e' legato al profilo manifest: per il metodo mobile
+        # si chiede il profilo "web" mantenendo token e UA Android, ottenendo
+        # il ladder completo (fino a 1080p / 8 Mbps).
+        if is_mobile:
+            for _pd in pbd:
+                _mu = _pd.get("ManifestUrl") or ""
+                if not _mu:
+                    continue
+                _new = re.sub(r'([?&])p=[^&]*', r'\1p=web', _mu)
+                if "p=" not in _new:
+                    _new += ("&" if "?" in _new else "?") + "p=web"
+                # Sostituisce anche il segmento path del profilo (es. /mob25f/ -> /web/)
+                _new = re.sub(r'/mob25f/', '/web/', _new)
+                if _new != _mu:
+                    console.print("[dim]  -> Profilo manifest mobile forzato a p=web (1080p)[/dim]")
+                    _pd["ManifestUrl"] = _new
+
         det = pbd[0]
         mpd_url_original = det.get("ManifestUrl", "")
         la_url = det.get("LaUrl", "")
@@ -905,19 +983,23 @@ class HeadlessExtractor:
         
         from dazn_navigator2.settings import get_setting
         engine = get_setting("extraction_engine")
+        session_impersonate = MOBILE_IMPERSONATE if is_mobile else None
 
-        if engine == "headless" and page:
+        if is_mobile:
+            # Il token mobile e' legato all'UA Android usato nella Playback API.
+            ua = ANDROID_PLAYER_UA
+        elif engine == "headless" and page:
             ua = await page.evaluate("navigator.userAgent")
         else:
             # L'UA reale inviato dalla sessione curl_cffi: il token CDN e' legato
             # esattamente a questo valore, un UA "quasi uguale" porta a HTTP 401.
-            client = await _get_http_session()
+            client = await _get_http_session(impersonate=session_impersonate)
             ua = await get_session_user_agent(client)
 
         dazn_token = cdn_value if cdn_value else (jwt if jwt else "")
 
         # Itera i PlaybackDetails per trovare la CDN funzionante (evita 401 Forbidden-682 su Akamai)
-        client = await _get_http_session()
+        client = await _get_http_session(impersonate=session_impersonate)
         import urllib.parse
         mpd_r = {"ok": False, "error": "Nessuna CDN valida"}
         chosen_pbd = None
@@ -985,6 +1067,28 @@ class HeadlessExtractor:
                     mpd_r = {"ok": False, "status": r_resp.status_code, "body": r_resp.text}
             except Exception as e:
                 mpd_r = {"ok": False, "error": str(e)}
+                # FIX: se il fetch curl fallisce con eccezione (es. timeout),
+                # provare comunque il fallback browser prima di arrendersi.
+                if page:
+                    try:
+                        page_ua = ""
+                        try:
+                            page_ua = await page.evaluate("navigator.userAgent")
+                        except Exception:
+                            page_ua = ""
+                        mpd_r = await page.evaluate(
+                            """async ({url, token}) => {
+                                try {
+                                    const r = await fetch(url, { headers: { "dazn-token": token } });
+                                    return { ok: r.ok, status: r.status, body: await r.text() };
+                                } catch(e) { return { ok: false, error: e.message }; }
+                            }""",
+                            {"url": c_fetch_url, "token": c_tok}
+                        )
+                        if mpd_r.get("ok"):
+                            c_ua_used = page_ua or ua
+                    except Exception as ex:
+                        mpd_r = {"ok": False, "error": f"curl_error_and_browser: {e} / browser: {ex}"}
 
             if mpd_r.get("ok"):
                 chosen_pbd = cand_pbd
@@ -1014,7 +1118,7 @@ class HeadlessExtractor:
         # Verifica finale: l'UA salvato deve essere quello accettato dalla CDN per
         # questo manifest (protegge da token generati con un profilo TLS diverso).
         ua = chosen_ua or ua
-        verified_ua = validate_cdn_user_agent(fetch_mpd_url, dazn_token, [ua] + ua_candidates())
+        verified_ua = validate_cdn_user_agent(fetch_mpd_url, dazn_token, [ua] + ua_candidates(), impersonate=session_impersonate)
         if verified_ua:
             if verified_ua != ua:
                 console.print(f"[dim]  -> UA verificato dalla CDN: Chrome/{''.join(c for c in verified_ua.split('Chrome/')[-1] if c.isdigit())[:3]}[/dim]")
@@ -1063,7 +1167,7 @@ class HeadlessExtractor:
             did_variants.append(real_id)
 
         lr = None
-        client = await _get_http_session()
+        client = await _get_http_session(impersonate=session_impersonate)
 
         def _lic_headers(cand_id, lic_ua):
             return {

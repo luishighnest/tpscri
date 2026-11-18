@@ -32,7 +32,8 @@ def _load(pid=None):
 
 def _save(data, pid=None):
     """Scrive il file locale dazn_event.json."""
-    EVENTS_FILE.write_text(json.dumps(data, indent=3, ensure_ascii=False) + "\n", encoding="utf-8")
+    with _save_lock:
+        EVENTS_FILE.write_text(json.dumps(data, indent=3, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def _normalize_ua(data):
@@ -48,6 +49,14 @@ def _normalize_ua(data):
         default_ua = detect_user_agent()
     except Exception:
         return data
+    WORKER_LIST = [
+        "https://young-bush-b452.lssfkp01.workers.dev",
+        "https://still-grass-35e0.kdjdj12121.workers.dev",
+        "https://steep-heart-a0a6.pippo2992k.workers.dev",
+        "https://still-morning-a752.ghjffvjuyggg.workers.dev",
+        "https://polished-sky-a2c7.rmddk2364.workers.dev"
+    ]
+    import urllib.parse
     for items in data.values():
         if not isinstance(items, list):
             continue
@@ -58,10 +67,12 @@ def _normalize_ua(data):
                 continue
             if not _valid_browser_ua(ev.get("ua") or ""):
                 ev["ua"] = default_ua
+            
     return data
 
 
 _push_lock = threading.Lock()
+_save_lock = threading.Lock()
 _push_pending = None
 _push_thread = None
 
@@ -313,13 +324,109 @@ def pool_entry(event, channel):
     }
 
 
+def _is_worker_url(url: str) -> bool:
+    return bool(url and ".workers.dev" in url)
+
+
 def add_event(comp_title, entry, pid=None, asincrono=False):
-    """Aggiunge/sostituisce un evento (dedup per titolo) e salva in locale."""
+    """Aggiunge/sostituisce un evento (dedup per titolo e tipo stream) e salva in locale."""
+    add_events(comp_title, [entry], pid=pid, asincrono=asincrono)
+
+
+def _mpd_token_exp(mpd):
+    """Epoch di scadenza del token contenuto nell'URL MPD (0 se assente).
+
+    Serve a capire se una nuova estrazione ha un token piu' fresco di quello
+    gia' salvato: senza questo controllo un evento riesumato manteneva il
+    vecchio token scaduto e continuava a non funzionare.
+    """
+    import re, base64, json
+    if not mpd:
+        return 0
+    token = ""
+    m = re.search(r"/@([^/]+)/", mpd)
+    if m:
+        token = m.group(1)
+    else:
+        m = re.search(r"[?&]dazn-token=([^&]+)", mpd)
+        if m:
+            token = m.group(1)
+    if not token:
+        return 0
+    if token.startswith("eyJ"):
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            return int(json.loads(base64.urlsafe_b64decode(payload)).get("exp") or 0)
+        except Exception:
+            return 0
+    m2 = re.search(r"tend:(\d+)", token)
+    if m2:
+        return int(m2.group(1))
+    return 0
+
+
+def add_events(comp_title, entries, pid=None, asincrono=False):
+    """Aggiunge/sostituisce una lista di eventi salvando esattamente le versioni specificate."""
+    if not entries:
+        return
     data = _load()
     comp_title = comp_title or "Eventi"
     grp = data.setdefault(comp_title, [])
-    grp[:] = [e for e in grp if e.get("name") != entry.get("name")]
-    grp.append(entry)
+
+    for entry in entries:
+        e_name = (entry.get("name") or "").strip()
+        e_key = (entry.get("key") or "").strip()
+        e_mpd = (entry.get("mpd") or "").strip()
+        e_method = (entry.get("method") or "").strip().lower()
+
+        # Estrai identificativo canale da stream DAZN (es. channel=1636 o path stream)
+        import re
+        m_chan = re.search(r'channel=(\d+)', e_mpd)
+        chan_id = m_chan.group(1) if m_chan else ""
+
+        def _is_same_event(existing):
+            ex_name = (existing.get("name") or "").strip()
+            ex_method = (existing.get("method") or "").strip().lower()
+            # Stessi metodo + stesso nome = evento identico (stesso flusso + stesso metodo)
+            if ex_name == e_name and ex_method == e_method:
+                return True
+            ex_key = (existing.get("key") or "").strip()
+            ex_mpd = (existing.get("mpd") or "").strip()
+            # Stessa chiave di decifrazione non vuota -> è lo stesso identico flusso live
+            if e_key and ex_key and e_key == ex_key:
+                return True
+            # Stesso canale stream DAZN
+            if chan_id:
+                m_ex = re.search(r'channel=(\d+)', ex_mpd)
+                if m_ex and m_ex.group(1) == chan_id:
+                    return True
+            return False
+
+        # Cerca se esiste già questo evento o il suo flusso duplicato
+        dups = [e for e in grp if _is_same_event(e)]
+        if dups:
+            # Se esiste già una versione, decidiamo quale tenere:
+            # Se la nuova entry ha "Fantacalcio Night" o ha un titolo più ricco/completo (o end valorizzato), sostituisce la vecchia
+            old = dups[0]
+            old_name = old.get("name", "")
+            new_exp = _mpd_token_exp(e_mpd)
+            old_exp = _mpd_token_exp(old.get("mpd") or "")
+            is_new_better = ("fantacalcio night" in e_name.lower() and "fantacalcio night" not in old_name.lower()) or \
+                            (bool(entry.get("end")) and not bool(old.get("end"))) or \
+                            (len(e_name) > len(old_name) and "fantacalcio night" not in old_name.lower()) or \
+                            (bool(new_exp) and (not old_exp or new_exp > old_exp + 60))
+            
+            if is_new_better:
+                # Sostituisci il vecchio con quello nuovo preferito
+                grp[:] = [e for e in grp if not _is_same_event(e)]
+                grp.append(entry)
+            else:
+                # La versione già presente è migliore o uguale, scarta il nuovo duplicato
+                continue
+        else:
+            grp.append(entry)
+
     pubblica(data=data, asincrono=asincrono)
 
 
@@ -357,7 +464,10 @@ def _sort_key(item):
     _, _, _, ev = item
     s = (ev.get("start") or "").strip()
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except Exception:
         return datetime.max.replace(tzinfo=timezone.utc)
 

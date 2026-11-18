@@ -1,13 +1,15 @@
 import asyncio
 import json
 import os
+import re
 import sys
 import shutil
 import time
 import zipfile
 import subprocess
+import urllib
+import urllib.parse
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request, Response, session, redirect, url_for
 
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
@@ -156,10 +158,11 @@ except Exception:
     pass
 
 import threading
-from dazn_navigator2.cli.eventi_cmds import _load, _save, _fetch_from_upstash, add_event, pubblica
+from dazn_navigator2.cli.eventi_cmds import _load, _save, _fetch_from_upstash, add_event, add_events, pubblica
 from dazn_navigator2.services.explorer import DaznExplorer
 from dazn_navigator2.services.extractor import HeadlessExtractor
 from dazn_navigator2.services.browser import BrowserManager
+from flask import Flask, render_template, jsonify, request, Response, session, redirect, url_for
 
 # Event loop persistente su thread dedicato per evitare 'Future attached to a different loop'
 _ASYNC_LOOP = None
@@ -176,9 +179,56 @@ _VOD_CACHE_LOCK = threading.Lock()
 # E' un timestamp con scadenza: si auto-azzera dopo il tempo indicato.
 _PROFILE_BUSY_UNTIL = 0.0
 
+# Lock globale di estrazione: impedisce collisioni contemporanee tra AutoExtract e click manuali
+_EXTRACTION_LOCK = threading.Lock()
+
 # Ultimo profilo usato dal sito: serve ai thread in background, dove la
-# sessione Flask non e' disponibile.
 _LAST_PID = None
+
+# ── Cloudflare Workers Pool a rotazione (Round-Robin) ────────────────────
+WORKERS_POOL = [
+    "https://young-bush-b452.lssfkp01.workers.dev",
+    "https://still-grass-35e0.kdjdj12121.workers.dev",
+    "https://steep-heart-a0a6.pippo2992k.workers.dev",
+    "https://still-morning-a752.ghjffvjuyggg.workers.dev",
+    "https://polished-sky-a2c7.rmddk2364.workers.dev"
+]
+_WORKER_INDEX_FILE = BASE_DIR / "worker_index.txt"
+_WORKER_ENABLED_FILE = BASE_DIR / "worker_enabled.txt"
+_WORKER_ROTATION_LOCK = threading.Lock()
+
+def is_worker_option_enabled():
+    """Ritorna True se l'opzione di estrarre anche il link con Worker Cloudflare è attiva."""
+    try:
+        if _WORKER_ENABLED_FILE.exists():
+            return _WORKER_ENABLED_FILE.read_text(encoding="utf-8").strip() == "1"
+    except Exception:
+        pass
+    return False
+
+def set_worker_option_enabled(enabled: bool):
+    try:
+        _WORKER_ENABLED_FILE.write_text("1" if enabled else "0", encoding="utf-8")
+    except Exception:
+        pass
+
+def get_next_worker_prefix():
+    """Restituisce il prossimo worker manifest a rotazione (da 1 a 5, poi ricomincia da 1).
+    Salva l'indice su file così persiste anche se il server viene riavviato."""
+    with _WORKER_ROTATION_LOCK:
+        idx = 0
+        if _WORKER_INDEX_FILE.exists():
+            try:
+                idx = int(_WORKER_INDEX_FILE.read_text(encoding="utf-8").strip())
+            except Exception:
+                idx = 0
+        worker_url = WORKERS_POOL[idx % len(WORKERS_POOL)]
+        next_idx = (idx + 1) % len(WORKERS_POOL)
+        try:
+            _WORKER_INDEX_FILE.write_text(str(next_idx), encoding="utf-8")
+        except Exception:
+            pass
+        return f"{worker_url}/manifest?url="
 
 # --- Blocco dei tentativi di login ----------------------------------------
 # Senza un limite le password si possono provare all'infinito. Il conteggio
@@ -266,8 +316,18 @@ def run_async(coro, timeout=90):
             _ASYNC_LOOP = asyncio.new_event_loop()
             _ASYNC_THREAD = threading.Thread(target=_start_background_loop, args=(_ASYNC_LOOP,), daemon=True)
             _ASYNC_THREAD.start()
-    future = asyncio.run_coroutine_threadsafe(coro, _ASYNC_LOOP)
-    return future.result(timeout=timeout)
+    # Avvolge la coroutine in wait_for per garantire il timeout lato asyncio
+    async def _wrapped():
+        return await asyncio.wait_for(coro, timeout=timeout)
+    future = asyncio.run_coroutine_threadsafe(_wrapped(), _ASYNC_LOOP)
+    try:
+        return future.result(timeout=timeout + 5)
+    except Exception:
+        try:
+            future.cancel()
+        except Exception:
+            pass
+        raise
 
 app = Flask(__name__)
 
@@ -351,24 +411,26 @@ def _tile_image(tile) -> str:
 
 
 def _to_local_time(value: str) -> str:
-    """Converte un orario UTC di DAZN nell'ora italiana.
-
-    DAZN restituisce gli orari in UTC ('2026-09-28T16:00:00Z') ma vengono
-    letti come se fossero gia' locali, quindi risultano indietro di 2 ore in
-    estate e di 1 in inverno. Si converte con il fuso Europe/Rome, che segue
-    l'ora legale: uno scarto fisso sbaglierebbe per metà dell'anno.
-    Restituisce 'YYYY-MM-DDTHH:MM:SS' senza suffisso, come richiesto.
-    """
-    if not value:
+    """Converte un orario UTC di DAZN nell'ora italiana (Europe/Rome)."""
+    if not value or not isinstance(value, str):
         return value if isinstance(value, str) else ""
+    s_val = value.strip()
+    if not s_val:
+        return ""
+    val_after_t = s_val[10:] if len(s_val) > 10 else s_val
+    if "Z" not in s_val and "+" not in val_after_t and "-" not in val_after_t:
+        return s_val
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta
         try:
             from zoneinfo import ZoneInfo
             tz = ZoneInfo("Europe/Rome")
         except Exception:
-            tz = timezone.utc
-        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            dt_temp = datetime.fromisoformat(s_val.replace("Z", "+00:00"))
+            month = dt_temp.month
+            offset_hours = 2 if 3 <= month <= 10 else 1
+            tz = timezone(timedelta(hours=offset_hours))
+        dt = datetime.fromisoformat(s_val.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(tz).strftime("%Y-%m-%dT%H:%M:%S")
@@ -511,6 +573,46 @@ def _build_mpd_auth(mpd_url: str, dazn_token: str, cdn_name: str = "dazn-token")
         sep = "&" if "?" in mpd_url else "?"
         return f"{mpd_url}{sep}{param_name}={dazn_token}"
 
+def normalize_event_title(title: str) -> str:
+    """Uniforma categoricamente il titolo dello scontro nel formato standard: 'Squadra 1 - Squadra 2'."""
+    if not title:
+        return ""
+    import re
+    t = re.sub(r'\s*\((?:WARP|WORKER|ACE|TEST ACE)\)\s*', ' ', title, flags=re.IGNORECASE).strip()
+    if t.strip().upper() == "DAZN":
+        return "DAZN 1"
+    if t.strip().upper() == "EUROSPORT":
+        return "Eurosport 1"
+    if re.search(r'\bZONA\s+SERIE\s+B\b', t, flags=re.IGNORECASE):
+        return "ZONA SERIE B"
+    if re.search(r'\bZONA\s+SERIE\s+A\b', t, flags=re.IGNORECASE):
+        return "ZONA SERIE A"
+    if re.search(r'\bZONA\s+GOL\b', t, flags=re.IGNORECASE):
+        return "ZONA GOL"
+    # Rimuove prefissi o suffissi tipo MD1, MD2, MD7, Giornata X
+    t = re.sub(r'\s*\bMD\s*\d+\b\s*', ' ', t, flags=re.IGNORECASE)
+    # Sostituisce 'v', 'vs', 'vs.', 'v.' con o senza spazi dopo il punto in ' - '
+    t = re.sub(r'\s+(?:vs?\.?)\s+', ' - ', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s+(?:vs?)\.(?=[^\s])', ' - ', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s*-\s*', ' - ', t)
+    t = re.sub(r'\s{2,}', ' ', t).strip()
+    return t
+
+def _norm_for_dedup(name):
+    """Normalizza un nome evento per deduplicazione.
+    Rimuove: prefissi studio ('Fuoriclasse | ', 'Zona Gol | ' ecc.),
+    accenti, suffissi tecnici (WARP/TEST/ACE) e spazi extra.
+    """
+    import unicodedata as _ud
+    n = (name or "").strip().lower()
+    # Rimuovi prefissi tipo "Fuoriclasse | " o "Studio | " prima del match
+    n = re.sub(r'^[^|]+\|\s*', '', n).strip()
+    # Rimuovi accenti per match robusto (Atletico vs Atlético)
+    n = _ud.normalize('NFKD', n)
+    n = ''.join(c for c in n if not _ud.combining(c))
+    n = re.sub(r'\s*\((?:warp|worker|ace|test ace)\)\s*', ' ', n, flags=re.IGNORECASE).strip()
+    n = re.sub(r'\s+test\s*$', '', n, flags=re.IGNORECASE).strip()
+    return n
 def _format_tile_item(t):
     raw = getattr(t, 'raw', {}) or {}
     sport = raw.get("Sport", {})
@@ -537,11 +639,8 @@ def _format_tile_item(t):
         elif sport:
             comp = sport
 
-    title_str = getattr(t, 'title', '') or ''
-    if title_str.strip().upper() == "DAZN":
-        title_str = "DAZN 1"
-    elif title_str.strip().upper() == "EUROSPORT":
-        title_str = "Eurosport 1"
+    raw_title = getattr(t, 'title', '') or ''
+    title_str = normalize_event_title(raw_title)
 
     return {
         "id": t.id,
@@ -551,8 +650,8 @@ def _format_tile_item(t):
         "competition": comp or "Eventi",
         "image": _image_url(t.image),
         "tile_type": t.tile_type,
-        "start": raw.get("Start") or "",
-        "end": raw.get("End") or "",
+        "start": _to_local_time(raw.get("Start") or ""),
+        "end": _to_local_time(raw.get("End") or ""),
     }
 
 def _resolve_profile_dir(path_str):
@@ -637,6 +736,783 @@ def login_page():
     if "user_profile_id" in session:
         return redirect("/script")
     return render_template("login.html")
+
+@app.route("/lba-auth", methods=["GET", "POST"])
+def lba_auth_page():
+    if "user_profile_id" not in session:
+        return redirect("/login")
+
+    from dazn_navigator2.auth import lba_auth
+
+    if request.method == "POST":
+        azione = request.form.get("azione", "").strip()
+        if azione == "logout":
+            lba_auth.cancella_sessione()
+            return redirect("/lba-auth")
+
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "").strip()
+        ok, msg = lba_auth.accedi(email, password)
+        stato = lba_auth.stato_sessione()
+        if ok:
+            return render_template("lba_auth.html", stato=stato, ok_message=msg)
+        return render_template("lba_auth.html", stato=stato, error=msg)
+
+    stato = lba_auth.stato_sessione()
+    return render_template("lba_auth.html", stato=stato)
+
+@app.route("/api/lba/probe", methods=["GET"])
+def api_lba_probe():
+    from dazn_navigator2.auth import lba_auth
+    import urllib.request, urllib.error
+    sess = lba_auth.carica_sessione()
+    token = sess.get("authorisationToken", "")
+    
+    headers = {
+        "x-api-key": "857a1e5d-e35e-4fdf-805b-a87b6f8364bf",
+        "realm": "dce.lba",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "Mozilla/5.0"
+    }
+    
+    candidates = [
+        "/api/v2/navigation",
+        "/api/v1/init",
+        "/api/v2/home",
+        "/api/v2/section",
+        "/api/v2/sections",
+        "/api/v2/rail",
+        "/api/v2/rails",
+        "/api/v2/bucket/home",
+        "/api/v2/bucket/live",
+        "/api/v2/bucket/vod",
+        "/api/v2/event",
+        "/api/v2/events",
+        "/api/v2/vod",
+        "/api/v2/vods",
+        "/api/v3/event",
+        "/api/v3/events",
+        "/api/v3/vod",
+        "/api/v3/vods",
+        "/api/v2/feed",
+        "/api/v2/content",
+        "/api/v3/content",
+        "/api/v3/external-table",
+        "/api/v3/manifest/event",
+        "/api/v3/manifest/video"
+    ]
+    
+    results = {}
+    for c in candidates:
+        url = "https://dce-frontoffice.imggaming.com" + c
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = resp.read().decode('utf-8', errors='ignore')
+                results[c] = {"status": resp.status, "body": data[:300]}
+        except urllib.error.HTTPError as e:
+            results[c] = {"status": e.code, "body": e.read().decode('utf-8', errors='ignore')[:150]}
+        except Exception as ex:
+            results[c] = {"status": "ERR", "body": str(ex)}
+            
+    return jsonify(results)
+
+
+def get_active_tunnel_url(fallback_request=None) -> str:
+    """Restituisce l'URL pubblico attivo del tunnel Cloudflare (da cf_bat.log) oppure fallback da request."""
+    import re
+    log_path = os.path.expandvars(r"%TEMP%\opencode\cf_bat.log")
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+                matches = re.findall(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", content)
+                if matches:
+                    return matches[-1].rstrip("/")
+        except Exception as e:
+            print(f"[get_active_tunnel_url error] {e}")
+            
+    if fallback_request:
+        host = fallback_request.headers.get("X-Forwarded-Host") or fallback_request.headers.get("Host") or fallback_request.host
+        proto = fallback_request.headers.get("X-Forwarded-Proto") or ("https" if fallback_request.is_secure else "http")
+        return f"{proto}://{host}".rstrip("/")
+        
+    return "http://127.0.0.1:5000"
+
+
+@app.route("/lba")
+def lba_page():
+    if "user_profile_id" not in session:
+        return redirect("/login")
+    return render_template("lba_script.html", profile_name=session.get("user_profile_name", "Profilo"))
+
+@app.route("/api/lba/catalog", methods=["GET"])
+def api_lba_catalog():
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.services import lba_extractor
+    try:
+        cat = lba_extractor.get_catalog()
+        return jsonify({"ok": True, "catalog": cat})
+    except Exception as e:
+        return jsonify({"ok": False, "errore": str(e)}), 500
+
+@app.route("/api/lba/extract-single", methods=["POST"])
+def api_lba_extract_single():
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.services import lba_extractor
+    data = request.get_json(silent=True) or {}
+    item_id = data.get("id")
+    title = data.get("title", f"LBA Event {item_id}")
+    image = data.get("image", "")
+    start = data.get("start", "")
+    is_vod = data.get("is_vod", False)
+    
+    if not item_id:
+        return jsonify({"ok": False, "errore": "ID evento mancante"}), 400
+        
+    res, err = lba_extractor.estrai_stream_e_chiave(item_id, is_vod=is_vod)
+    if not res:
+        return jsonify({"ok": False, "errore": err}), 400
+        
+    mpd_url = res["mpd"]
+
+    ev = {
+        "name": title,
+        "image": image,
+        "start": start,
+        "end": "",
+        "mpd": mpd_url,
+        "key": res["key"],
+        "ua": res["ua"],
+        "referer": res["referer"],
+        "lba_id": item_id,
+        "is_vod": is_vod
+    }
+    
+    # Salva in dazn_event.json sotto 'LBA TV'
+    ev_file = BASE_DIR / "dazn_event.json"
+    cat_data = {}
+    if ev_file.exists():
+        try:
+            cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+        except Exception:
+            cat_data = {}
+    if "LBA TV" not in cat_data:
+        cat_data["LBA TV"] = []
+        
+    cat_data["LBA TV"] = [e for e in cat_data["LBA TV"] if e.get("name") != title]
+    cat_data["LBA TV"].append(ev)
+    ev_file.write_text(json.dumps(cat_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    
+    try:
+        from dazn_navigator2.cli.eventi_cmds import pubblica
+        pubblica('Aggiornato LBA', cat_data, asincrono=False)
+    except Exception as e:
+        print(f"[LBA Sync Upstash] {e}")
+        
+    return jsonify({"ok": True, "event": ev})
+
+_LBA_AUTO_FAIL_UNTIL: dict = {}  # id -> timestamp: backoff auto-extract (eventi non live)
+_LBA_LAST_AUTO_RUN = 0.0  # ultima esecuzione auto-extract LBA (throttle globale)
+_LBA_AUTO_EXTRACT_ENABLED = True  # auto-extract LBA riabilitato su richiesta
+
+# ── NBA TV ──────────────────────────────────────────────────────────────────
+@app.route("/nba-auth", methods=["GET", "POST"])
+def nba_auth_page():
+    if "user_profile_id" not in session:
+        return redirect("/login")
+    from dazn_navigator2.auth import nba_auth
+    if request.method == "POST":
+        azione = request.form.get("azione", "").strip()
+        if azione == "logout":
+            nba_auth.cancella_sessione()
+            return redirect("/nba-auth")
+        if azione == "refresh":
+            ok, msg = nba_auth.aggiorna_auth_token()
+            stato = nba_auth.stato_sessione()
+            if ok:
+                return render_template("nba_auth.html", stato=stato, ok_message=msg)
+            return render_template("nba_auth.html", stato=stato, error=msg)
+        email = request.form.get("email", "").strip()
+        password = request.form.get("password", "").strip()
+        ok, msg = nba_auth.accedi(email, password)
+        stato = nba_auth.stato_sessione()
+        if ok:
+            return render_template("nba_auth.html", stato=stato, ok_message=msg)
+        return render_template("nba_auth.html", stato=stato, error=msg)
+    stato = nba_auth.stato_sessione()
+    return render_template("nba_auth.html", stato=stato)
+
+
+@app.route("/api/nba/refresh-token", methods=["POST"])
+def api_nba_refresh_token():
+    """Rinnova il token STS NBA senza re-login (usa cookies di sessione salvati)."""
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.auth import nba_auth
+    ok, msg = nba_auth.aggiorna_auth_token()
+    return jsonify({"ok": ok, "messaggio": msg})
+
+
+@app.route("/nba")
+def nba_page():
+    if "user_profile_id" not in session:
+        return redirect("/login")
+    from dazn_navigator2.auth import nba_auth
+    stato = nba_auth.stato_sessione()
+    return render_template("nba_script.html", profile_name=session.get("user_profile_name", "Profilo"))
+
+
+@app.route("/api/nba/extract", methods=["POST"])
+def api_nba_extract():
+    """Estrai NBA TV Live (NBATVI) - retrocompatibilità."""
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.services import nba_extractor
+    res, err = nba_extractor.estrai_stream_e_chiave("NBATVI", is_vod=False)
+    if not res:
+        return jsonify({"ok": False, "errore": err}), 400
+    ev = {
+        "name"   : "NBA TV Live",
+        "image"  : "https://cdn.nba.com/logos/leagues/L/logo-nba.svg",
+        "start"  : "",
+        "end"    : "",
+        "mpd"    : res.get("mpd", ""),
+        "key"    : res["key"],
+        "ua"     : res["ua"],
+        "referer": res["referer"],
+        "is_vod" : False,
+    }
+    ev_file  = BASE_DIR / "dazn_event.json"
+    cat_data = {}
+    if ev_file.exists():
+        try:
+            cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+        except Exception:
+            cat_data = {}
+    if "NBA League Pass" not in cat_data:
+        cat_data["NBA League Pass"] = []
+    cat_data["NBA League Pass"] = [e for e in cat_data["NBA League Pass"] if e.get("name") != "NBA TV Live"]
+    cat_data["NBA League Pass"].insert(0, ev)
+    ev_file.write_text(json.dumps(cat_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    try:
+        from dazn_navigator2.cli.eventi_cmds import pubblica
+        pubblica('Aggiornato NBA League Pass', cat_data, asincrono=False)
+    except Exception as e:
+        print(f"[NBA Sync Upstash] {e}")
+    return jsonify({"ok": True, "event": ev})
+
+
+@app.route("/api/nba/catalog", methods=["GET"])
+def api_nba_catalog():
+    """Catalogo partite NBA (live / upcoming / vod) senza estrarre stream."""
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.services import nba_extractor
+    try:
+        cat = nba_extractor.get_catalog()
+        return jsonify({"ok": True, "catalog": cat})
+    except Exception as e:
+        return jsonify({"ok": False, "errore": str(e)}), 500
+
+
+@app.route("/api/nba/extract-single", methods=["POST"])
+def api_nba_extract_single():
+    """Estrai stream + chiave per un singolo evento NBA LP."""
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.services import nba_extractor
+    data     = request.get_json(silent=True) or {}
+    media_id = data.get("media_id") or data.get("id", "")
+    title    = data.get("title", f"NBA {media_id}")
+    image    = data.get("image", "https://cdn.nba.com/logos/leagues/L/logo-nba.svg")
+    start    = data.get("start", "")
+    is_vod   = data.get("is_vod", False)
+
+    if not media_id:
+        return jsonify({"ok": False, "errore": "media_id mancante"}), 400
+
+    res, err = nba_extractor.estrai_stream_e_chiave(media_id, is_vod=is_vod)
+    if not res:
+        return jsonify({"ok": False, "errore": err}), 400
+
+    ev = {
+        "name"    : title,
+        "image"   : image,
+        "start"   : start,
+        "end"     : "",
+        "mpd"     : res.get("mpd", ""),
+        "key"     : res.get("key", ""),
+        "ua"      : res.get("ua", ""),
+        "referer" : res.get("referer", ""),
+        "media_id": media_id,
+        "is_vod"  : is_vod,
+    }
+
+    # Salva in dazn_event.json -> 'NBA League Pass'
+    ev_file  = BASE_DIR / "dazn_event.json"
+    cat_data = {}
+    if ev_file.exists():
+        try:
+            cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+        except Exception:
+            cat_data = {}
+    if "NBA League Pass" not in cat_data:
+        cat_data["NBA League Pass"] = []
+    cat_data["NBA League Pass"] = [e for e in cat_data["NBA League Pass"] if e.get("name") != title]
+    cat_data["NBA League Pass"].append(ev)
+    ev_file.write_text(json.dumps(cat_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    try:
+        from dazn_navigator2.cli.eventi_cmds import pubblica
+        pubblica('Aggiornato NBA League Pass', cat_data, asincrono=False)
+    except Exception as e:
+        print(f"[NBA Single Sync] {e}")
+
+    return jsonify({"ok": True, "event": ev})
+
+
+@app.route("/api/nba/manual-push", methods=["POST"])
+def api_nba_manual_push():
+    """Riceve i curl bash copiati per MPD e Licenza, estrae PSSH e chiave Widevine, salva e pubblica."""
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+
+    import re, base64
+    from pathlib import Path
+    from pywidevine import PSSH, Cdm, Device
+    from curl_cffi import requests as cf_req
+
+    data = request.get_json(silent=True) or {}
+    curl_mpd = data.get("curl_mpd", "").strip()
+    curl_lic = data.get("curl_lic", "").strip()
+    title = data.get("title", "").strip() or "NBA Stream"
+    image = data.get("image", "").strip() or "https://cdn.nba.com/logos/leagues/L/logo-nba.svg"
+    cat_name = data.get("categoria", "").strip() or "NBA League Pass"
+
+    if not curl_mpd or not curl_lic:
+        return jsonify({"ok": False, "errore": "Inserisci sia il curl/link del manifest che della licenza!"}), 400
+
+    def parse_curl_cmd(cmd_text):
+        import shlex
+        # Rimuovi backslash di continuazione riga
+        clean_text = cmd_text.replace('\\\n', ' ').replace('\\\r\n', ' ').replace('\\', ' ')
+        try:
+            tokens = shlex.split(clean_text, posix=False)
+        except Exception:
+            tokens = clean_text.split()
+
+        url = ""
+        headers = {}
+        cookies = ""
+
+        i = 0
+        while i < len(tokens):
+            t = tokens[i].strip()
+            if t in ("--url", "-u"):
+                if i + 1 < len(tokens):
+                    url = tokens[i+1].strip("\"'")
+                    i += 1
+            elif t in ("-H", "--header"):
+                if i + 1 < len(tokens):
+                    h_val = tokens[i+1].strip("\"'")
+                    if ':' in h_val:
+                        k, v = h_val.split(':', 1)
+                        headers[k.strip().lower()] = v.strip()
+                    i += 1
+            elif t in ("-b", "--cookie"):
+                if i + 1 < len(tokens):
+                    cookies = tokens[i+1].strip("\"'")
+                    i += 1
+            elif t.startswith("http://") or t.startswith("https://") or t.startswith('"http') or t.startswith("'http"):
+                if not url:
+                    url = t.strip("\"'")
+            i += 1
+
+        # Fallback regex se tokenizzazione fallisce
+        if not url:
+            m_u = re.search(r'''(?:--url\s+)?['"](https?://[^'"]+)['"]''', cmd_text) or re.search(r'''(https?://[^\s'"]+)''', cmd_text)
+            if m_u:
+                url = m_u.group(1)
+        if not cookies and "cookie" in headers:
+            cookies = headers["cookie"]
+
+        return url, headers, cookies
+
+    mpd_url, mpd_headers, mpd_cookies = parse_curl_cmd(curl_mpd)
+    lic_url, lic_headers_in, lic_cookies = parse_curl_cmd(curl_lic)
+
+    if not mpd_url:
+        return jsonify({"ok": False, "errore": "URL Manifest non trovato nel comando curl."}), 400
+    if not lic_url:
+        return jsonify({"ok": False, "errore": "URL Licenza non trovato nel comando curl."}), 400
+
+    # 1. Scarico Manifest HLS/MPD (tentativo con e senza authorizationtoken/cookie)
+    h_manifest = {
+        "User-Agent": mpd_headers.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+        "Referer": mpd_headers.get("referer", "https://www.nba.com/"),
+        "Origin": mpd_headers.get("origin", "https://www.nba.com"),
+    }
+    auth_tok = lic_headers_in.get("authorizationtoken") or mpd_headers.get("authorizationtoken", "")
+    all_cookies = mpd_cookies or lic_cookies
+
+    manifest_txt = ""
+    last_err = ""
+
+    # Strategia 1: Con headers completi e cookie
+    h1 = dict(h_manifest)
+    if auth_tok:
+        h1["authorizationtoken"] = auth_tok
+    if all_cookies:
+        h1["Cookie"] = all_cookies
+
+    try:
+        r_man = cf_req.get(mpd_url, impersonate="chrome131", headers=h1, timeout=15)
+        if r_man.status_code == 200:
+            manifest_txt = r_man.text
+        else:
+            last_err = f"HTTP {r_man.status_code}: {r_man.text[:120]}"
+    except Exception as e:
+        last_err = str(e)
+
+    # Strategia 2: Se 400, Akamai spesso rifiuta l'header authorizationtoken sul manifest HLS! Riprova senza.
+    if not manifest_txt:
+        h2 = dict(h_manifest)
+        if all_cookies:
+            h2["Cookie"] = all_cookies
+        try:
+            r_man2 = cf_req.get(mpd_url, impersonate="chrome131", headers=h2, timeout=15)
+            if r_man2.status_code == 200:
+                manifest_txt = r_man2.text
+            else:
+                last_err = f"HTTP {r_man2.status_code}: {r_man2.text[:120]}"
+        except Exception as e:
+            last_err = str(e)
+
+    # Strategia 3: Pulito solo con User-Agent
+    if not manifest_txt:
+        try:
+            r_man3 = cf_req.get(mpd_url, impersonate="chrome131", headers={"User-Agent": h_manifest["User-Agent"]}, timeout=15)
+            if r_man3.status_code == 200:
+                manifest_txt = r_man3.text
+            else:
+                last_err = f"HTTP {r_man3.status_code}: {r_man3.text[:120]}"
+        except Exception as e:
+            last_err = str(e)
+
+    # Strategia 4 (RISOLUTIVA AKAMAI): Sanitizzazione parametri sporchi (es. _fw_*, hdnts, gpp)
+    # Akamai va in HTTP 400 se riceve parametri pubblicitari/tracciamento non concordati
+    if not manifest_txt and "?" in mpd_url:
+        import urllib.parse
+        try:
+            p_parsed = urllib.parse.urlparse(mpd_url)
+            p_qs = urllib.parse.parse_qs(p_parsed.query)
+            # Conserva solo parametri essenziali per lo stream
+            keep_keys = {"addUserInfo", "start", "end", "sessionId", "PostalCode", "Zip", "LatLongRadius", "ISO3166", "vpmute"}
+            clean_qs = {k: v for k, v in p_qs.items() if k in keep_keys}
+            if not clean_qs.get("addUserInfo"):
+                clean_qs["addUserInfo"] = ["1"]
+            if not clean_qs.get("sessionId") and p_qs.get("sessionId"):
+                clean_qs["sessionId"] = p_qs.get("sessionId")
+
+            sanitized_url = p_parsed.scheme + "://" + p_parsed.netloc + p_parsed.path + "?" + urllib.parse.urlencode(clean_qs, doseq=True)
+            r_man4 = cf_req.get(sanitized_url, impersonate="chrome131", headers={"User-Agent": h_manifest["User-Agent"]}, timeout=15)
+            if r_man4.status_code == 200:
+                manifest_txt = r_man4.text
+                mpd_url = sanitized_url
+            else:
+                last_err = f"HTTP {r_man4.status_code}: {r_man4.text[:120]}"
+        except Exception as e:
+            last_err = str(e)
+
+    # Strategia 5: Fallback minimo con solo sessionId
+    if not manifest_txt and "sessionId=" in mpd_url:
+        import urllib.parse, re
+        try:
+            base_m3u8 = mpd_url.split("?")[0]
+            m_s = re.search(r"sessionId=([^&]+)", mpd_url)
+            if m_s:
+                min_url = f"{base_m3u8}?addUserInfo=1&sessionId={m_s.group(1)}"
+                r_man5 = cf_req.get(min_url, impersonate="chrome131", headers={"User-Agent": h_manifest["User-Agent"]}, timeout=15)
+                if r_man5.status_code == 200:
+                    manifest_txt = r_man5.text
+                    mpd_url = min_url
+        except Exception as e:
+            last_err = str(e)
+
+    if not manifest_txt:
+        print(f"[ERROR NBA Manual] Manifest download failed: {last_err} | URL: {mpd_url}")
+        return jsonify({"ok": False, "errore": f"Manifest non scaricabile ({last_err}). Copia TUTTO il cURL bash del file index.m3u8 (inclusi i parametri di sessione dopo il punto interrogativo)!"}), 400
+
+    # 2. Estrazione PSSH Widevine
+    WV_ID = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+    pssh_b64 = ""
+    for line in manifest_txt.splitlines():
+        if (WV_ID in line.lower() or "widevine" in line.lower()) and ("EXT-X-KEY" in line or "EXT-X-SESSION-KEY" in line):
+            m = re.search(r'URI="data:text/plain;base64,([^"]+)"', line)
+            if m:
+                pssh_b64 = m.group(1)
+                break
+            m2 = re.search(r'URI="([^"]+)"', line)
+            if m2 and "base64," in m2.group(1):
+                pssh_b64 = m2.group(1).split("base64,")[1]
+                break
+
+    if not pssh_b64:
+        return jsonify({"ok": False, "errore": "PSSH Widevine non trovato nel manifest M3U8."}), 400
+
+    # 3. Richiesta Licenza Widevine
+    wvd_path = BASE_DIR / "device.wvd"
+    if not wvd_path.exists():
+        return jsonify({"ok": False, "errore": "device.wvd mancante nel server."}), 500
+
+    try:
+        dev = Device.load(str(wvd_path))
+        cdm = Cdm.from_device(dev)
+        sess_w = cdm.open()
+        challenge = cdm.get_license_challenge(sess_w, PSSH(base64.b64decode(pssh_b64)))
+
+        lic_h = {
+            "accept": "*/*",
+            "accept-language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+            "applicationtoken": lic_headers_in.get("applicationtoken", "201822"),
+            "authorizationtoken": auth_tok,
+            "azukiimc": lic_headers_in.get("azukiimc", "IMC7.5.0_AN_D3.0.0_S0"),
+            "content-type": "text/plain",
+            "deviceprofile": lic_headers_in.get("deviceprofile", "eyJtb2RlbCI6IkRlc2t0b3AiLCJvc1ZlcnNpb24iOiIxMCIsInZlbmRvck5hbWUiOiJNaWNyb3NvZnQiLCJvc1ZlcnNpb24iOiIxMCIsInZlbmRvck5hbWUiOiJNaWNyb3NvZnQiLCJvc05hbWUiOiJIVE1MNSIsInN1cHBvcnRzSGV2Y0RlY29kZSI6ZmFsc2UsInd2TGV2ZWwiOiJMMyIsImRldmljZVVVSUQiOiJmOTdmMzYxMjBiNGQ0NjI3YTY2ZGFjYTZmMTUzZmIxNiJ9"),
+            "origin": "https://www.nba.com",
+            "referer": "https://www.nba.com/",
+            "user-agent": lic_headers_in.get("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
+            "x-locationdetails": lic_headers_in.get("x-locationdetails", "eyJQb3N0YWxDb2RlIjoiODAxMzMiLCJDb3VudHJ5Q29kZSI6IklUIn0=")
+        }
+        if lic_cookies:
+            lic_h["Cookie"] = lic_cookies
+
+        # Fallback 1: curl_cffi con content binario
+        r_lic = None
+        try:
+            r_lic = cf_req.post(lic_url, content=bytes(challenge), headers=lic_h, impersonate="chrome131", timeout=15)
+        except Exception:
+            pass
+
+        # Fallback 2: urllib nativo (come in nba_manual_push.py) se curl_cffi fallisce o restituisce 403
+        if not r_lic or r_lic.status_code != 200:
+            import urllib.request
+            try:
+                req_u = urllib.request.Request(lic_url, data=bytes(challenge), headers=lic_h, method="POST")
+                with urllib.request.urlopen(req_u, timeout=15) as resp_u:
+                    class _URLLibResp:
+                        status_code = resp_u.status
+                        content = resp_u.read()
+                        text = content.decode("utf-8", errors="replace")
+                    r_lic = _URLLibResp()
+            except urllib.error.HTTPError as e:
+                class _URLLibErr:
+                    status_code = e.code
+                    content = e.read()
+                    text = content.decode("utf-8", errors="replace")
+                # Se urllib restituisce un codice diverso, aggiorniamo se curl_cffi era fallito
+                if not r_lic:
+                    r_lic = _URLLibErr()
+            except Exception:
+                pass
+
+        if not r_lic or r_lic.status_code != 200:
+            cdm.close(sess_w)
+            err_msg = r_lic.text[:200] if r_lic else "Nessuna risposta dal server licenze"
+            st_code = r_lic.status_code if r_lic else 500
+            return jsonify({"ok": False, "errore": f"Licenza HTTP {st_code}: {err_msg}"}), 400
+
+        cdm.parse_license(sess_w, r_lic.content)
+        keys = [f"{k.kid.hex}:{k.key.hex()}" for k in cdm.get_keys(sess_w) if k.type == "CONTENT"]
+        cdm.close(sess_w)
+
+        if not keys:
+            return jsonify({"ok": False, "errore": "Nessuna content key nella risposta della licenza."}), 400
+        content_key = keys[0]
+    except Exception as e:
+        return jsonify({"ok": False, "errore": f"Errore decifratura licenza: {e}"}), 400
+
+    # 4. Estrazione media_id dall'URL se possibile
+    m_id_match = re.search(r'/hls-wvpr/([^/?]+)', mpd_url) or re.search(r'mediaId=([^&]+)', lic_url)
+    media_id = m_id_match.group(1) if m_id_match else "MANUAL"
+
+    ev = {
+        "name": title,
+        "image": image,
+        "start": "",
+        "end": "",
+        "mpd": mpd_url,
+        "key": content_key,
+        "ua": lic_h["user-agent"],
+        "referer": "https://www.nba.com/",
+        "media_id": media_id,
+        "is_vod": False,
+        "added_at": int(time.time()),
+    }
+
+    # Salva in dazn_event.json e pubblica su Upstash
+    ev_file = BASE_DIR / "dazn_event.json"
+    cat_data = {}
+    if ev_file.exists():
+        try:
+            cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+        except Exception:
+            cat_data = {}
+    if cat_name not in cat_data:
+        cat_data[cat_name] = []
+    cat_data[cat_name] = [e for e in cat_data[cat_name] if e.get("name") != title]
+    cat_data[cat_name].append(ev)
+    ev_file.write_text(json.dumps(cat_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    try:
+        from dazn_navigator2.cli.eventi_cmds import pubblica
+        pubblica(f"NBA Manual: {title}", cat_data, asincrono=False)
+    except Exception as e:
+        print(f"[NBA Manual Sync Upstash] {e}")
+
+    return jsonify({"ok": True, "event": ev})
+
+
+@app.route("/api/nba/estrai", methods=["POST"])
+def api_nba_estrai():
+    """Estrai batch di eventi NBA (live / upcoming / vod / all)."""
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.services import nba_extractor
+    data = request.get_json(silent=True) or {}
+    tipo = data.get("tipo", "live")
+
+    risultato = nba_extractor.estrai_eventi(tipo=tipo)
+    if not risultato.get("ok"):
+        return jsonify(risultato), 400
+
+    eventi = risultato.get("eventi", [])
+    if eventi:
+        ev_file  = BASE_DIR / "dazn_event.json"
+        cat_data = {}
+        if ev_file.exists():
+            try:
+                cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+            except Exception:
+                cat_data = {}
+        if "NBA League Pass" not in cat_data:
+            cat_data["NBA League Pass"] = []
+
+        nomi = {e.get("name") for e in cat_data["NBA League Pass"]}
+        for ev in eventi:
+            name = ev.get("name")
+            if name in nomi:
+                cat_data["NBA League Pass"] = [
+                    e if e.get("name") != name else ev
+                    for e in cat_data["NBA League Pass"]
+                ]
+            else:
+                cat_data["NBA League Pass"].append(ev)
+                nomi.add(name)
+
+        ev_file.write_text(json.dumps(cat_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            from dazn_navigator2.cli.eventi_cmds import pubblica
+            pubblica('Aggiornato NBA League Pass', cat_data, asincrono=False)
+        except Exception as e:
+            print(f"[NBA Batch Sync] {e}")
+
+    return jsonify({"ok": True, "estratti": len(eventi), "eventi": eventi, "errori": risultato.get("errori", [])})
+
+
+@app.route("/api/nba/capture-token", methods=["POST"])
+def api_nba_capture_token():
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    from dazn_navigator2.auth import nba_auth
+    ok, msg = nba_auth.accedi("", "")
+    if ok:
+        return jsonify({"ok": True, "messaggio": msg})
+    return jsonify({"ok": False, "errore": msg}), 400
+
+
+@app.route("/api/nba/extracted", methods=["GET"])
+def api_nba_extracted():
+    """Ritorna gli eventi NBA League Pass già estratti nel dazn_event.json."""
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    ev_file = BASE_DIR / "dazn_event.json"
+    cat_data = {}
+    if ev_file.exists():
+        try:
+            cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+        except Exception:
+            cat_data = {}
+    # Supporta sia la vecchia categoria 'NBA TV' che la nuova 'NBA League Pass'
+    events = cat_data.get("NBA League Pass", []) or cat_data.get("NBA TV", [])
+    return jsonify({"ok": True, "events": events})
+
+
+
+@app.route("/api/lba/extracted", methods=["GET"])
+def api_lba_extracted():
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    ev_file = BASE_DIR / "dazn_event.json"
+    items = []
+    if ev_file.exists():
+        try:
+            cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+            items = cat_data.get("LBA TV", [])
+        except Exception:
+            items = []
+    return jsonify({"ok": True, "events": items})
+
+@app.route("/api/lba/estrai", methods=["POST"])
+def api_lba_estrai():
+    if "user_profile_id" not in session:
+        return jsonify({"ok": False, "errore": "Non autenticato"}), 401
+    
+    from dazn_navigator2.services import lba_extractor
+    data = request.get_json(silent=True) or {}
+    tipo = data.get("tipo", "both")
+    
+    risultato = lba_extractor.estrai_eventi(tipo=tipo)
+    if not risultato.get("ok"):
+        return jsonify(risultato), 400
+        
+    eventi = risultato.get("eventi", [])
+    if eventi:
+        # Aggiungi a dazn_event.json sotto la categoria 'LBA TV'
+        ev_file = BASE_DIR / "dazn_event.json"
+        cat_data = {}
+        if ev_file.exists():
+            try:
+                cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+            except Exception:
+                cat_data = {}
+        
+        if "LBA TV" not in cat_data:
+            cat_data["LBA TV"] = []
+            
+        # Aggiorna o inserisci
+        nomi_esistenti = {e.get("name") for e in cat_data["LBA TV"]}
+        for ev in eventi:
+            if ev.get("name") in nomi_esistenti:
+                # sostituisci
+                cat_data["LBA TV"] = [e if e.get("name") != ev.get("name") else ev for e in cat_data["LBA TV"]]
+            else:
+                cat_data["LBA TV"].append(ev)
+                nomi_esistenti.add(ev.get("name"))
+                
+        ev_file.write_text(json.dumps(cat_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        
+        # Sincronizza su Upstash
+        try:
+            from dazn_navigator2.cli.eventi_cmds import pubblica
+            pubblica('Aggiornato LBA', cat_data, asincrono=False)
+        except Exception as e:
+            print(f"[LBA Sync Upstash] {e}")
+
+    return jsonify({"ok": True, "estratti": len(eventi), "eventi": eventi})
 
 @app.route("/script")
 def script_page():
@@ -1011,6 +1887,10 @@ def _background_dazn_refresher():
 _refresher_thread = threading.Thread(target=_background_dazn_refresher, daemon=True)
 _refresher_thread.start()
 
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({"ok": True})
+
 @app.route("/api/session-status", methods=["GET"])
 def api_session_status():
     """Restituisce lo stato e la scadenza (exp) del token JWT DAZN del profilo attivo."""
@@ -1069,8 +1949,73 @@ def api_refresh_dazn_session():
     """Endpoint per sollecitare il rinnovo manuale o via cron/webhook della sessione DAZN."""
     if "user_profile_id" not in session:
         return jsonify({"ok": False, "error": "Non autenticato"}), 401
+    pid = _current_pid()
     try:
+        # 1. Prova prima con il rinnovo API
         refresh_all_dazn_sessions(force=True)
+        
+        # 2. Verifica se il token per il profilo corrente è effettivamente valido
+        profile_dir = Path(get_active_chrome_profile(pid))
+        session_file = profile_dir / "dazn_session.json"
+        auth_file = profile_dir / "auth_token.json"
+        
+        current_jwt = ""
+        if session_file.exists():
+            try:
+                current_jwt = json.loads(session_file.read_text(encoding="utf-8")).get("jwt", "")
+            except Exception:
+                pass
+        if not current_jwt and auth_file.exists():
+            try:
+                current_jwt = json.loads(auth_file.read_text(encoding="utf-8")).get("jwt", "")
+            except Exception:
+                pass
+                
+        is_expired = True
+        if current_jwt and current_jwt.startswith("eyJ"):
+            try:
+                import base64
+                p_b64 = current_jwt.split(".")[1]
+                p_b64 += "=" * ((4 - len(p_b64) % 4) % 4)
+                exp = json.loads(base64.b64decode(p_b64).decode("utf-8")).get("exp", 0)
+                if exp > time.time():
+                    is_expired = False
+            except Exception:
+                pass
+                
+        # 3. Se ancora scaduto, avvia il browser del profilo in background per prendere il nuovo token live da DAZN!
+        if is_expired:
+            print(f"[Refresh Session] Token per {pid} scaduto o non rinnovato da API: recupero da browser...")
+            async def _renew_via_browser():
+                from dazn_navigator2.services.browser import get_browser
+                b = await get_browser(user_data_dir=profile_dir)
+                if b:
+                    await b.ensure_session()
+                    jwt_browser = await b.evaluate("localStorage.getItem('MISL.authToken')")
+                    if jwt_browser and jwt_browser.startswith("eyJ"):
+                        import base64
+                        p_b64 = jwt_browser.split(".")[1]
+                        p_b64 += "=" * ((4 - len(p_b64) % 4) % 4)
+                        b_exp = json.loads(base64.b64decode(p_b64).decode("utf-8")).get("exp", 0)
+                        if b_exp > time.time():
+                            s_data = {}
+                            if session_file.exists():
+                                try:
+                                    s_data = json.loads(session_file.read_text(encoding="utf-8"))
+                                except Exception:
+                                    pass
+                            s_data["jwt"] = jwt_browser
+                            s_data["created_at"] = int(time.time())
+                            session_file.write_text(json.dumps(s_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                            auth_file.write_text(json.dumps({"jwt": jwt_browser}), encoding="utf-8")
+                            print(f"[Refresh Session] Token rinnovato con successo dal browser per {pid}!")
+                            return True
+                return False
+                
+            success = run_async(_renew_via_browser(), timeout=40)
+            if not success:
+                return jsonify({"ok": False, "error": "Impossibile rinnovare il token (cookie DAZN scaduti nel profilo)"}), 400
+
         return jsonify({"ok": True, "message": "Rinnovo sessione eseguito con successo!"})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1080,27 +2025,19 @@ def get_saved_events():
     if "user_profile_id" not in session:
         return jsonify({"error": "Non autenticato"}), 401
     
-    local_data = _load(_current_pid()) or {}
+    local_data = _load() or {}
     try:
         import requests
         url = "https://ace-seal-162556.upstash.io/get/stream:eventi_mpd"
         headers = {"Authorization": f"Bearer {_upstash_token()}"}
-        res = requests.get(url, headers=headers, timeout=10)
+        res = requests.get(url, headers=headers, timeout=5)
         if res.ok:
             raw = res.json().get("result")
             if raw and raw != "null":
                 upstash_data = json.loads(raw)
-                if isinstance(upstash_data, dict) and upstash_data:
-                    merged = dict(upstash_data)
-                    for comp, items in local_data.items():
-                        if comp not in merged:
-                            merged[comp] = items
-                        else:
-                            existing_names = {e.get("name") for e in merged[comp] if isinstance(e, dict)}
-                            for item in items:
-                                if isinstance(item, dict) and item.get("name") not in existing_names:
-                                    merged[comp].append(item)
-                    return jsonify(merged)
+                if isinstance(upstash_data, dict):
+                    # Teniamo upstash_data come fonte primaria
+                    return jsonify(upstash_data)
     except Exception as e:
         print(f"[Upstash API Error] {e}")
     return jsonify(local_data)
@@ -1169,54 +2106,71 @@ def rename_saved_event():
 def delete_saved_event():
     if "user_profile_id" not in session:
         return jsonify({"ok": False, "error": "Non autenticato"}), 401
-    body = request.get_json() or {}
+    body = request.get_json(silent=True) or {}
+    
+    # 1. Cancellazione totale
     if body.get("all"):
-        pubblica("Cancellati tutti gli eventi", {}, asincrono=True)
+        pubblica("Cancellati tutti gli eventi", {}, asincrono=False)
         return jsonify({"ok": True})
     
-    comp = body.get("comp")
+    comp = (body.get("comp") or "").strip()
     index = body.get("index")
-    ev_name = body.get("name")
+    ev_name = (body.get("name") or "").strip()
     
-    data = _fetch_from_upstash()
+    # Prendi lo stato corrente da dazn_event.json / Upstash
+    data = _fetch_from_upstash() or {}
     removed = False
 
-    # 1. Tenta per comp + index
-    if comp and comp in data and index is not None:
-        idx = int(index)
-        if 0 <= idx < len(data[comp]):
-            del data[comp][idx]
-            if not data[comp]:
-                del data[comp]
-            removed = True
-
-    # 2. Fallback per nome dell'evento
-    if not removed and ev_name:
+    # 1. Cancellazione per Nome (più affidabile e univoco)
+    if ev_name:
         for c, items in list(data.items()):
-            new_items = [e for e in items if e.get("name") != ev_name]
-            if len(new_items) < len(items):
+            if comp and c.strip().lower() != comp.lower():
+                continue
+            orig_len = len(items)
+            new_items = [e for e in items if (e.get("name") or "").strip() != ev_name]
+            if len(new_items) < orig_len:
                 if new_items:
                     data[c] = new_items
                 else:
                     del data[c]
                 removed = True
                 break
-
-    # 3. Fallback per comp case-insensitive
-    if not removed and comp and index is not None:
-        idx = int(index)
-        for c in list(data.keys()):
-            if c.strip().lower() == comp.strip().lower():
-                if 0 <= idx < len(data[c]):
-                    del data[c][idx]
-                    if not data[c]:
+        
+        # Se non trovato con filtro comp, cerca in tutte le categorie
+        if not removed:
+            for c, items in list(data.items()):
+                orig_len = len(items)
+                new_items = [e for e in items if (e.get("name") or "").strip() != ev_name]
+                if len(new_items) < orig_len:
+                    if new_items:
+                        data[c] = new_items
+                    else:
                         del data[c]
                     removed = True
                     break
 
+    # 2. Cancellazione per Categoria + Indice (se nome non specificato o fallback)
+    if not removed and comp and index is not None:
+        idx = int(index)
+        # Cerca comp esatto o case-insensitive
+        target_comp = None
+        if comp in data:
+            target_comp = comp
+        else:
+            for c in data.keys():
+                if c.strip().lower() == comp.lower():
+                    target_comp = c
+                    break
+        
+        if target_comp and 0 <= idx < len(data[target_comp]):
+            del data[target_comp][idx]
+            if not data[target_comp]:
+                del data[target_comp]
+            removed = True
+
     if removed:
-        pubblica("Rimosso evento", data, asincrono=True)
-        return jsonify({"ok": True})
+        pubblica("Rimosso evento", data, asincrono=False)
+        return jsonify({"ok": True, "data": data})
         
     return jsonify({"ok": False, "error": "Evento non trovato"}), 404
 
@@ -1554,9 +2508,9 @@ def get_linear_channels():
                     if match[0].image:
                         it["image"] = _image_url(match[0].image)
                     if match[0].raw.get("Start"):
-                        it["start"] = match[0].raw.get("Start")
+                        it["start"] = _to_local_time(match[0].raw.get("Start"))
                     if match[0].raw.get("End"):
-                        it["end"] = match[0].raw.get("End")
+                        it["end"] = _to_local_time(match[0].raw.get("End"))
             except Exception:
                 pass
 
@@ -1568,7 +2522,7 @@ def get_linear_channels():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+        
 @app.route("/api/search", methods=["GET"])
 def search_events():
     if "user_profile_id" not in session:
@@ -1590,6 +2544,31 @@ def search_events():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/worker-option", methods=["GET", "POST"])
+def worker_option_api():
+    if "user_profile_id" not in session:
+        return jsonify({"error": "Non autenticato"}), 401
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        enabled = bool(payload.get("enabled", False))
+        set_worker_option_enabled(enabled)
+        return jsonify({"ok": True, "enabled": is_worker_option_enabled()})
+    return jsonify({"enabled": is_worker_option_enabled()})
+
+@app.route("/api/extraction-method", methods=["GET", "POST"])
+def extraction_method_api():
+    if "user_profile_id" not in session:
+        return jsonify({"error": "Non autenticato"}), 401
+    from dazn_navigator2.settings import get_extraction_method, set_extraction_method
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or {}
+        method = str(payload.get("method") or "").strip().lower()
+        if method not in ("web", "mobile"):
+            return jsonify({"ok": False, "error": "Metodo non valido (web/mobile)"}), 400
+        set_extraction_method(method)
+        return jsonify({"ok": True, "method": get_extraction_method()})
+    return jsonify({"method": get_extraction_method()})
 
 @app.route("/api/diagnose")
 def diagnose():
@@ -1676,9 +2655,9 @@ def extract_stream():
                         if c_title and c_title not in ("Eventi Live", "Eventi"):
                             competition = c_title
                             if not start and raw.get("Start"):
-                                start = raw.get("Start")
+                                start = _to_local_time(raw.get("Start"))
                             if not end and raw.get("End"):
-                                end = raw.get("End")
+                                end = _to_local_time(raw.get("End"))
                             break
 
                     if not competition or competition in ("Eventi Live", "Eventi"):
@@ -1719,73 +2698,80 @@ def extract_stream():
                 except Exception:
                     logo = ""
 
-            base_titolo = res.get("titolo") or title
-            import re
-            event_name = re.sub(r'\s*\(WARP\)\s*', ' ', base_titolo, flags=re.IGNORECASE).strip()
-            if event_name.strip().upper() == "DAZN":
-                event_name = "DAZN 1"
-            elif event_name.strip().upper() == "EUROSPORT":
-                event_name = "Eurosport 1"
+            base_titolo = (title or "").strip() or res.get("titolo") or "Evento"
+            event_name = normalize_event_title(base_titolo)
 
-            entry = {
+            # Canali lineari / Live TV: start ed end devono essere sempre VUOTI
+            if is_linear_chan or competition == "Live TV" or "3000-" in str(end):
+                ev_start = ""
+                ev_end = ""
+            else:
+                ev_start = _to_local_time(start)
+                ev_end = _to_local_time(end)
+                if not ev_start:
+                    from datetime import datetime as _dt_start
+                    ev_start = _dt_start.now().strftime("%Y-%m-%dT%H:%M:%S")
+                if not ev_end:
+                    try:
+                        from dazn_navigator2.services.playlist_ed import token_expiry as _token_expiry
+                        _exp_dt = _token_expiry(dazn_token)
+                        if _exp_dt:
+                            ev_end = _exp_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                    except Exception:
+                        pass
+
+            # Versione WARP (Diretto pulito)
+            from dazn_navigator2.settings import get_extraction_method
+            _meth = get_extraction_method()
+            entry_warp = {
                 "name": event_name,
                 "image": logo,
-                # DAZN manda gli orari in UTC: si convertono all'ora italiana.
-                "start": _to_local_time(start),
-                "end": _to_local_time(end),
+                "start": ev_start,
+                "end": ev_end,
                 "mpd": mpd_auth,
                 "key": keys_str,
-                "ua": ua_str
+                "ua": ua_str,
+                "method": _meth
             }
-            # I canali lineari non hanno un orario di evento: Start/End nei rail
-            # sono date sentinella (2024-05-23, 3000-01-01), quindi si azzerano.
-            if is_linear_chan:
-                entry["start"] = ""
-                entry["end"] = ""
-            add_event(competition, entry, _current_pid(), asincrono=True)
+
+            if is_worker_option_enabled():
+                worker_prefix = get_next_worker_prefix()
+                final_mpd_worker = f"{worker_prefix}{urllib.parse.quote(mpd_auth, safe='')}&ua={urllib.parse.quote(ua_str, safe='')}"
+                entry_worker = {
+                    "name": event_name,
+                    "image": logo,
+                    "start": ev_start,
+                    "end": ev_end,
+                    "mpd": final_mpd_worker,
+                    "key": keys_str,
+                    "ua": ua_str,
+                    "method": _meth
+                }
+                events_to_add = [entry_worker]
+            else:
+                events_to_add = [entry_warp]
+
+            add_events(competition, events_to_add, _current_pid(), asincrono=True)
             sync_to_github(f"extract: salvato evento {event_name} ({_current_pid()})")
             res["mpd_url"] = mpd_auth
             res["mpd_auth"] = mpd_auth
-            res["entry"] = entry
+            res["entry"] = entry_warp
             res["competition"] = competition
         return res
 
     try:
-        result = run_async(_do_extract(), timeout=90)
+        result = run_async(_do_extract(), timeout=180)
         return jsonify(result)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-@app.route("/playlist.m3u", methods=["GET"])
-def generate_m3u():
-    from dazn_navigator2.services.extractor import detect_user_agent
-    default_ua = detect_user_agent()
-    data = _load(_current_pid())
-    lines = ["#EXTM3U"]
-    for comp, items in data.items():
-        for ev in items:
-            name = ev.get("name", "Evento")
-            logo = ev.get("logo") or ev.get("image", "")
-            mpd = ev.get("mpd") or ev.get("manifest", "")
-            keys = ev.get("key") or ev.get("keys", "")
-            ua = (ev.get("ua") or "").strip() or default_ua
 
-            props = f'#EXTINF:-1 tvg-name="{name}" tvg-logo="{logo}" group-title="{comp}",{name}'
-            if keys:
-                # ClearKey: inputstream.adaptive accetta solo drm_legacy
-                # (license_key viene rifiutata -> nessuna chiave -> niente video)
-                lines.append(f'#KODIPROP:inputstream.adaptive.drm_legacy=org.w3.clearkey|{keys.replace("|", ",")}')
-            hdrs = f'User-Agent={ua}&Referer=https://www.dazn.com/&Origin=https://www.dazn.com'
-            lines.append(f'#KODIPROP:inputstream.adaptive.manifest_headers={hdrs}')
-            lines.append(f'#KODIPROP:inputstream.adaptive.stream_headers={hdrs}')
-            lines.append(props)
-            lines.append(mpd)
-    
-    return Response("\n".join(lines), mimetype="audio/x-mpegurl")
 
 def _auto_extract_worker():
     """Scansiona e estrae automaticamente e istantaneamente tutti gli eventi Live delle competizioni target."""
+    global _LBA_LAST_AUTO_RUN
     import time
+    import re
     from datetime import datetime, timezone
     
     TARGET_COMPETITIONS = {
@@ -1819,9 +2805,14 @@ def _auto_extract_worker():
                             extracted_names.add(n)
                 
                 explorer = DaznExplorer()
-                # Cerca contenuti live
+                # Recupera prima di tutto i live dalla Rail ufficiale 'Live' (stessa sorgente della UI)
                 tiles = []
-                for query in ("Serie A", "Serie B", "LaLiga", "Live"):
+                try:
+                    live_rail = await explorer.get_tiles("Live")
+                    tiles.extend(live_rail)
+                except Exception:
+                    pass
+                for query in ("Serie A", "Serie B", "LaLiga"):
                     try:
                         res = await explorer.search(query)
                         tiles.extend(res)
@@ -1868,11 +2859,17 @@ def _auto_extract_worker():
                     if not is_live:
                         continue
                     
-                    # Verifica se e' gia' stato estratto
+                    # Verifica se e' gia' stato estratto con titolo uniformato
                     ev_title = t.title.strip()
-                    import re
-                    clean_title = re.sub(r'\s*\(WARP\)\s*', ' ', ev_title, flags=re.IGNORECASE).strip()
-                    if clean_title.lower() in extracted_names:
+                    clean_title = normalize_event_title(ev_title)
+                    # Normalizza anche i nomi gia' estratti rimuovendo suffissi come TEST
+
+                    clean_for_check = _norm_for_dedup(clean_title)
+                    existing_normalized = {_norm_for_dedup(n) for n in extracted_names}
+                    if clean_for_check and clean_for_check in existing_normalized:
+                        continue
+                    # Match fuzzy: se un nome esistente contiene o e' contenuto nel candidato, salta
+                    if clean_for_check and any(clean_for_check in ex or ex in clean_for_check for ex in existing_normalized if ex):
                         continue
                     
                     candidates.append({
@@ -1880,18 +2877,35 @@ def _auto_extract_worker():
                         "title": clean_title,
                         "competition": c_title,
                         "image": _image_url(t.image),
-                        "start": start_str,
-                        "end": end_str
+                        "start": _to_local_time(start_str),
+                        "end": _to_local_time(end_str)
                     })
                 
                 await explorer.close()
+
+                # Deduplica e ordina i candidati:
+                # Se è presente sia "Fantacalcio Night | Squadra 1 - Squadra 2" che "Squadra 1 - Squadra 2",
+                # scarta la versione base e tieni solo quella Fantacalcio Night.
+                filtered_candidates = []
+                all_cand_titles = [c["title"].lower() for c in candidates]
+                for cand in candidates:
+                    c_low = cand["title"].lower()
+                    # Se questo è un titolo base (senza fantacalcio night) ma esiste una versione Fantacalcio Night per la stessa partita:
+                    has_fantacalcio_counterpart = any(
+                        "fantacalcio night" in other and c_low in other
+                        for other in all_cand_titles
+                    )
+                    if has_fantacalcio_counterpart and "fantacalcio night" not in c_low:
+                        print(f"[AutoExtract] Scartata versione base '{cand['title']}' in favore di Fantacalcio Night")
+                        continue
+                    filtered_candidates.append(cand)
                 
                 # Estrai ciascun evento mancante
-                for cand in candidates:
+                for cand in filtered_candidates:
                     print(f"[AutoExtract] Rilevato evento LIVE da estrarre: {cand['title']} ({cand['competition']})")
                     try:
                         ext = HeadlessExtractor()
-                        res = await ext.estrai(target_profile_dir, cand["asset_id"], cand["title"])
+                        res = await asyncio.wait_for(ext.estrai(target_profile_dir, cand["asset_id"], cand["title"]), timeout=120)
                         if res.get("ok"):
                             mpd_url = res.get("mpd_url", "")
                             dazn_token = res.get("dazn_token", "")
@@ -1901,16 +2915,53 @@ def _auto_extract_worker():
                             ua_str = (res.get("ua") or "").strip() or detect_user_agent()
                             logo = cand["image"] or _image_url(res.get("image"))
                             
-                            entry = {
+                            ev_start = _to_local_time(cand["start"])
+                            ev_end = _to_local_time(cand["end"])
+                            # Fallback: nessun evento deve restare senza scadenza.
+                            if not ev_start:
+                                from datetime import datetime as _dt_start
+                                ev_start = _dt_start.now().strftime("%Y-%m-%dT%H:%M:%S")
+                            if not ev_end:
+                                try:
+                                    from dazn_navigator2.services.playlist_ed import token_expiry as _token_expiry
+                                    _exp_dt = _token_expiry(dazn_token)
+                                    if _exp_dt:
+                                        ev_end = _exp_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                                except Exception:
+                                    pass
+
+                            # Versione WARP (Diretto pulito)
+                            from dazn_navigator2.settings import get_extraction_method
+                            _meth = get_extraction_method()
+                            entry_warp = {
                                 "name": cand["title"],
                                 "image": logo,
-                                "start": cand["start"],
-                                "end": cand["end"],
+                                "start": ev_start,
+                                "end": ev_end,
                                 "mpd": mpd_auth,
                                 "key": keys_str,
-                                "ua": ua_str
+                                "ua": ua_str,
+                                "method": _meth
                             }
-                            add_event(cand["competition"], entry, pid, asincrono=True)
+
+                            if is_worker_option_enabled():
+                                worker_prefix = get_next_worker_prefix()
+                                final_mpd_worker = f"{worker_prefix}{urllib.parse.quote(mpd_auth, safe='')}&ua={urllib.parse.quote(ua_str, safe='')}"
+                                entry_worker = {
+                                    "name": cand["title"],
+                                    "image": logo,
+                                    "start": ev_start,
+                                    "end": ev_end,
+                                    "mpd": final_mpd_worker,
+                                    "key": keys_str,
+                                    "ua": ua_str,
+                                    "method": _meth
+                                }
+                                events_to_add = [entry_worker]
+                            else:
+                                events_to_add = [entry_warp]
+
+                            add_events(cand["competition"], events_to_add, pid, asincrono=True)
                             sync_to_github(f"auto-extract: {cand['title']} ({cand['competition']})")
                             print(f"[AutoExtract] Estratto e sincronizzato con successo: {cand['title']}")
                             extracted_names.add(cand["title"].lower())
@@ -1918,15 +2969,152 @@ def _auto_extract_worker():
                         print(f"[AutoExtract Error] Errore estrazione {cand['title']}: {err}")
                     time.sleep(2)
             
-            run_async(_check_and_extract(), timeout=180)
+            run_async(_check_and_extract(), timeout=900)  # 15 min: copre fino a ~7 eventi × 120 s
         except Exception as e:
-            pass
+            import traceback; traceback.print_exc()
+            print(f"[AutoExtract Loop Error] {type(e).__name__}: {e}", flush=True)
+
+        # -------------------------------------------------------------
+        # AUTO-EXTRACT LBA TV (LIVE EVENTS)
+        # -------------------------------------------------------------
+        try:
+            from dazn_navigator2.services import lba_extractor
+            # Auto-extract LBA disabilitato: si estrae solo su richiesta (UI),
+            # cosi' in 'LBA TV' resta unicamente l'evento scelto dall'utente.
+            if not _LBA_AUTO_EXTRACT_ENABLED:
+                time.sleep(45)
+                continue
+            # Esegui l'auto-extract LBA al massimo ogni 120s: il backend DGE
+            # rate-limita le richieste ravvicinate (401 "Invalid timestamp").
+            if time.time() - _LBA_LAST_AUTO_RUN < 120:
+                time.sleep(45)
+                continue
+            _LBA_LAST_AUTO_RUN = time.time()
+            cat = lba_extractor.get_catalog()
+            live_items = cat.get("live", [])
+            if live_items:
+                ev_file = BASE_DIR / "dazn_event.json"
+                cat_data = {}
+                if ev_file.exists():
+                    try:
+                        cat_data = json.loads(ev_file.read_text(encoding="utf-8"))
+                    except Exception:
+                        cat_data = {}
+                if "LBA TV" not in cat_data:
+                    cat_data["LBA TV"] = []
+                
+                # Nomi già presenti con chiave non vuota
+                existing_lba = {e.get("lba_id"): e for e in cat_data["LBA TV"] if e.get("lba_id")}
+                lba_aggiornato = False
+                _extracted_this_cycle = 0
+
+                for l_it in live_items:
+                    l_id = l_it.get("id")
+                    if not l_id:
+                        continue
+                    # Max 1 estrazione per ciclo: non saturare l'API.
+                    if _extracted_this_cycle >= 1:
+                        break
+                    # Se già estratto con chiave valida, salta.
+                    curr_entry = existing_lba.get(l_id)
+                    if curr_entry and curr_entry.get("key") and curr_entry.get("mpd"):
+                        continue
+
+                    print(f"[AutoExtract LBA] Rilevato evento LIVE LBA da estrarre: {l_it.get('title')} (ID: {l_id})")
+                    if time.time() < _LBA_AUTO_FAIL_UNTIL.get(l_id, 0):
+                        continue
+                    res, err = lba_extractor.estrai_stream_e_chiave(l_id, is_vod=False)
+                    if res and res.get("mpd"):
+                        ev_obj = {
+                            "name": l_it.get("title") or f"LBA Event {l_id}",
+                            "image": l_it.get("image") or "",
+                            "start": l_it.get("start") or "",
+                            "end": "",
+                            "mpd": res.get("mpd"),
+                            "key": res.get("key") or "",
+                            "ua": res.get("ua") or "",
+                            "referer": res.get("referer") or "",
+                            "lba_id": l_id,
+                            "is_vod": False
+                        }
+                        # Rimuovi eventuale duplicato per nome/id e inserisci
+                        cat_data["LBA TV"] = [e for e in cat_data["LBA TV"] if e.get("lba_id") != l_id and e.get("name") != ev_obj["name"]]
+                        cat_data["LBA TV"].append(ev_obj)
+                        lba_aggiornato = True
+                        print(f"[AutoExtract LBA] Estratto con successo: {ev_obj['name']} | Key: {ev_obj['key'][:16]}...")
+                    else:
+                        print(f"[AutoExtract LBA Error] ID {l_id}: {err}")
+                        # Rate limit: backoff lungo. Evento non live/offline: 5 min.
+                        if "401" in str(err):
+                            _LBA_AUTO_FAIL_UNTIL[l_id] = time.time() + 180
+                        else:
+                            _LBA_AUTO_FAIL_UNTIL[l_id] = time.time() + 300
+                    _extracted_this_cycle += 1
+                    time.sleep(15)
+
+                if lba_aggiornato:
+                    ev_file.write_text(json.dumps(cat_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                    try:
+                        from dazn_navigator2.cli.eventi_cmds import pubblica
+                        pubblica("AutoExtract LBA Live", cat_data, asincrono=True)
+                        print("[AutoExtract LBA] Sincronizzato su Upstash e JSON locale.")
+                    except Exception as e_pub:
+                        print(f"[AutoExtract LBA Sync Error] {e_pub}")
+        except Exception as e_lba:
+            print(f"[AutoExtract LBA Loop Error] {e_lba}")
         
         time.sleep(45)  # Riesegue il controllo ogni 45 secondi
 
 # Avvia il worker in background
 _auto_thread = threading.Thread(target=_auto_extract_worker, daemon=True)
 _auto_thread.start()
+
+
+# (Keepalive MPD LBA rimosso: si usa l'estrazione normale con MPD diretto.)
+
+# Watchdog del loop asyncio: se si blocca, lo ricrea
+def _async_watchdog():
+    import time
+    while True:
+        time.sleep(60)
+        try:
+            run_async(asyncio.sleep(0), timeout=5)
+        except Exception:
+            global _ASYNC_LOOP, _ASYNC_THREAD
+            with _LOOP_LOCK:
+                try:
+                    if _ASYNC_LOOP is not None:
+                        _ASYNC_LOOP.stop()
+                except Exception:
+                    pass
+                _ASYNC_LOOP = asyncio.new_event_loop()
+                _ASYNC_THREAD = threading.Thread(target=_start_background_loop, args=(_ASYNC_LOOP,), daemon=True)
+                _ASYNC_THREAD.start()
+            try:
+                from dazn_navigator2.services.browser import _browser_instance
+                # reset browser instance
+                import dazn_navigator2.services.browser as _bm
+                _bm._browser_instance = None
+            except Exception:
+                pass
+            print("[Watchdog] Loop asyncio ricreato", flush=True)
+
+threading.Thread(target=_async_watchdog, daemon=True).start()
+
+# Supervisore del thread auto-extract: se muore, lo riavvia
+def _auto_extract_supervisor():
+    import time
+    global _auto_thread
+    while True:
+        time.sleep(30)
+        if _auto_thread is None or not _auto_thread.is_alive():
+            try:
+                _auto_thread = threading.Thread(target=_auto_extract_worker, daemon=True)
+                _auto_thread.start()
+                print("[Supervisor] Auto-extract thread riavviato", flush=True)
+            except Exception as e:
+                print(f"[Supervisor] Errore riavvio: {e}", flush=True)
+threading.Thread(target=_auto_extract_supervisor, daemon=True).start()
 
 
 def _profilo_con_token():
@@ -2004,10 +3192,308 @@ def _warmup_browser_context(pid=None):
     except Exception as e:
         print(f"[Warmup] Saltato: {e}")
 
+@app.route("/stream/live/<path:event_name>")
+def stream_live_event(event_name):
+    """Ponte live per Kodi e player: decifra MPD con ClearKey al volo via FFmpeg e lo serve in MPEG-TS continuo."""
+    import urllib.parse
+    target = urllib.parse.unquote(event_name).strip()
+    ev = None
+    try:
+        p = Path(__file__).resolve().parent / "dazn_event.json"
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                local_data = json.load(f)
+            for cat, items in local_data.items():
+                for it in items:
+                    name_clean = it.get("name", "").replace(" (TEST ACE)", "").replace(" (ACE)", "").strip()
+                    target_clean = target.replace(" (TEST ACE)", "").replace(" (ACE)", "").strip()
+                    if (it.get("name") == target or name_clean == target_clean) and it.get("key"):
+                        ev = it
+                        break
+                if ev:
+                    break
+    except Exception:
+        pass
+
+    if not ev:
+        return "Evento non trovato o senza licenza", 404
+
+    mpd_url = ev.get("mpd")
+    clearkey = ev.get("key")
+    ua = ev.get("ua", "")
+    key_hex = clearkey.split(":")[-1].strip() if ":" in clearkey else clearkey.strip()
+    ffmpeg_exe = str(Path(r"C:\Users\alecl\Desktop\PROJECT_HUB\tools\ffmpeg.exe"))
+
+    cmd = [
+        ffmpeg_exe,
+        "-cenc_decryption_key", key_hex,
+        "-headers", f"User-Agent: {ua}\r\nReferer: https://www.dazn.com/\r\nOrigin: https://www.dazn.com\r\n",
+        "-probesize", "500000",
+        "-analyzeduration", "1000000",
+        "-i", mpd_url,
+        "-map", "0:v:4",
+        "-map", "0:a:0",
+        "-c", "copy",
+        "-f", "mpegts",
+        "pipe:1"
+    ]
+
+    def _generate():
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            chunk = proc.stdout.read(65536)
+            if chunk:
+                yield chunk
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.terminate()
+
+    from flask import Response
+    resp = Response(_generate(), mimetype="video/mp2t")
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+# ─── SISTEMA STATISTICHE E CONTEGGIO SPETTATORI LIVE (IN TEMPO REALE) ───
+import time as _t_mod
+_LIVE_VIEWERS = {}          # { event_key: { client_id: timestamp } }
+_HISTORICAL_VIEWERS = {}    # { event_key: set([client_id, ...]) }
+_HISTORICAL_ALL = set()     # set([client_id, ...])
+_TOTAL_PLAY_CLICKS = {}     # { event_key: count }
+_LAST_CLICK_TIME = {}       # { (event_key, client_id): timestamp }
+_VIEWERS_LOCK = threading.Lock()
+
+def _record_viewer(event_key, client_id, is_play_click=False):
+    now = _t_mod.time()
+    with _VIEWERS_LOCK:
+        if event_key not in _LIVE_VIEWERS:
+            _LIVE_VIEWERS[event_key] = {}
+        _LIVE_VIEWERS[event_key][client_id] = now
+
+        if event_key not in _HISTORICAL_VIEWERS:
+            _HISTORICAL_VIEWERS[event_key] = set()
+        _HISTORICAL_VIEWERS[event_key].add(client_id)
+        _HISTORICAL_ALL.add(client_id)
+
+        if is_play_click:
+            # Debounce: lo stesso client sullo stesso evento non può contare un nuovo click
+            # se si riconnette entro 12 secondi (evita i re-fetch di chiusura/seek/probe del player)
+            key_pair = (event_key, client_id)
+            last_click = _LAST_CLICK_TIME.get(key_pair, 0)
+            if now - last_click >= 12:
+                _LAST_CLICK_TIME[key_pair] = now
+                _TOTAL_PLAY_CLICKS[event_key] = _TOTAL_PLAY_CLICKS.get(event_key, 0) + 1
+
+def _clean_and_get_stats():
+    now = _t_mod.time()
+    ttl = 45  # spettatore attivo negli ultimi 45 secondi
+    live_events = {}
+    total_live = 0
+    with _VIEWERS_LOCK:
+        for ev_key, clients in list(_LIVE_VIEWERS.items()):
+            active = [cid for cid, last_seen in clients.items() if now - last_seen <= ttl]
+            _LIVE_VIEWERS[ev_key] = {cid: clients[cid] for cid in active}
+            count = len(active)
+            if count > 0:
+                live_events[ev_key] = count
+                total_live += count
+
+        # Unione di tutti gli eventi conosciuti
+        all_event_keys = sorted(list(set(list(_HISTORICAL_VIEWERS.keys()) + list(_TOTAL_PLAY_CLICKS.keys()) + list(live_events.keys()))))
+        detailed_events = {}
+        total_clicks = sum(_TOTAL_PLAY_CLICKS.values())
+        total_unique = len(_HISTORICAL_ALL)
+
+        for ev in all_event_keys:
+            detailed_events[ev] = {
+                "live_viewers": live_events.get(ev, 0),
+                "total_unique_viewers": len(_HISTORICAL_VIEWERS.get(ev, set())),
+                "play_clicks": _TOTAL_PLAY_CLICKS.get(ev, 0)
+            }
+
+    return {
+        "total_viewers_live": total_live,
+        "total_unique_viewers": total_unique,
+        "total_play_clicks": total_clicks,
+        "events": detailed_events,
+        "timestamp": int(now)
+    }
+
+@app.route("/api/viewers/ping", methods=["GET", "POST"])
+def api_viewers_ping():
+    """Registra l'heartbeat di uno spettatore attivo."""
+    event = (request.values.get("event") or request.values.get("name") or "default").strip()
+    client_id = (request.values.get("cid") or request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or request.remote_addr or "anon").strip()
+    if client_id:
+        client_id = client_id.split(",")[0].strip()
+    _record_viewer(event, client_id, is_play_click=False)
+    return jsonify({"ok": True, "event": event, "status": "active"})
+
+@app.route("/api/viewers/click", methods=["GET", "POST"])
+def api_viewers_click():
+    """Registra esplicitamente un click sul tasto play."""
+    event = (request.values.get("event") or request.values.get("name") or "default").strip()
+    client_id = (request.values.get("cid") or request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or request.remote_addr or "anon").strip()
+    if client_id:
+        client_id = client_id.split(",")[0].strip()
+    _record_viewer(event, client_id, is_play_click=True)
+    return jsonify({"ok": True, "event": event, "status": "clicked"})
+
+@app.route("/api/viewers/stats", methods=["GET"])
+def api_viewers_stats():
+    """Endpoint pubblico per visualizzare quante persone sono collegate e i totali."""
+    data = _clean_and_get_stats()
+    return jsonify(data)
+
+@app.route("/live/stream.mpd", methods=["GET"])
+def live_stream_redirect():
+    """Endpoint trasparente: registra click + spettatore e reindirizza (302) al vero MPD."""
+    event = (request.args.get("name") or request.args.get("event") or request.args.get("id") or "Live Event").strip()
+    target = (request.args.get("target") or request.args.get("url") or "").strip()
+    
+    b64_target = request.args.get("b64")
+    if b64_target:
+        try:
+            import base64
+            target = base64.b64decode(b64_target).decode("utf-8")
+        except Exception:
+            pass
+
+    client_ip = (request.headers.get("CF-Connecting-IP") or request.headers.get("X-Forwarded-For") or request.remote_addr or "anon").strip()
+    if client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+
+    # Conta sia come click play sia come viewer
+    _record_viewer(event, client_ip, is_play_click=True)
+
+    if target:
+        from flask import redirect
+        return redirect(target, code=302)
+    return Response("Target MPD not specified", status=400, mimetype="text/plain")
+
+
+@app.route("/nba/master.m3u8", methods=["GET"])
+def nba_master_m3u8():
+    """Restituisce al volo un master playlist HLS con video + audio uniti per Kodi/ISA."""
+    v = request.args.get("v", "").strip()
+    a = request.args.get("a", "").strip()
+    if not v:
+        return Response("Missing video url (v)", status=400, mimetype="text/plain")
+
+    content = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n"
+    if a:
+        content += (
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",DEFAULT=YES,'
+            f'AUTOSELECT=YES,CHANNELS="2",URI="{a}"\n'
+            f'#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,'
+            f'CODECS="avc1.4d401f,mp4a.40.2",AUDIO="audio"\n'
+            f'{v}\n'
+        )
+    else:
+        content += (
+            f'#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,CODECS="avc1.4d401f"\n'
+            f'{v}\n'
+        )
+
+    res = Response(content, mimetype="application/vnd.apple.mpegurl")
+    res.headers["Access-Control-Allow-Origin"] = "*"
+    return res
+
+@app.route("/api/viewers", methods=["GET"])
+def api_viewers_ui():
+    """Dashboard visuale completa per monitorare spettatori live, totali unici e click play."""
+    stats = _clean_and_get_stats()
+    ev_html = ""
+    for ev, info in stats["events"].items():
+        live_badge = f"<span style='color:#00e59b;font-weight:bold;font-size:1.15rem;'>{info['live_viewers']}</span>" if info['live_viewers'] > 0 else "<span style='color:#64748b;'>0</span>"
+        ev_html += f"""<tr>
+            <td style='padding:12px;border-bottom:1px solid #1e293b;font-weight:600;'>{ev}</td>
+            <td style='padding:12px;border-bottom:1px solid #1e293b;text-align:center;'>{live_badge}</td>
+            <td style='padding:12px;border-bottom:1px solid #1e293b;text-align:center;color:#38bdf8;font-weight:bold;'>{info['total_unique_viewers']}</td>
+            <td style='padding:12px;border-bottom:1px solid #1e293b;text-align:center;color:#f59e0b;font-weight:bold;'>{info['play_clicks']}</td>
+        </tr>"""
+    if not ev_html:
+        ev_html = "<tr><td colspan='4' style='padding:24px;text-align:center;color:#64748b;'>Nessun dato registrato al momento. I dati si aggiornano appena qualcuno clicca o apre uno stream.</td></tr>"
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Live Viewers & Play Analytics - Script2</title>
+    <meta http-equiv="refresh" content="5">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0b0f14; color: #f8fafc; margin: 0; padding: 24px; display: flex; flex-direction: column; align-items: center; }}
+        .card {{ background: #111827; border: 1px solid #1f2937; border-radius: 14px; padding: 24px; width: 100%; max-width: 820px; box-shadow: 0 10px 30px rgba(0,0,0,0.6); }}
+        h1 {{ margin: 0 0 18px 0; font-size: 1.45rem; display: flex; align-items: center; gap: 10px; }}
+        .badge {{ background: #ef4444; color: #fff; font-size: 0.72rem; padding: 4px 8px; border-radius: 6px; text-transform: uppercase; letter-spacing: 1px; font-weight: 800; animation: pulse 2s infinite; }}
+        @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.4; }} }}
+        
+        .grid-stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 22px; }}
+        .stat-box {{ background: #1e293b; border-radius: 10px; padding: 14px; text-align: center; border: 1px solid #334155; }}
+        .stat-box.green {{ border-color: rgba(0, 229, 155, 0.4); background: rgba(0, 229, 155, 0.06); }}
+        .stat-box.blue {{ border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.06); }}
+        .stat-box.orange {{ border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.06); }}
+        .stat-label {{ color: #94a3b8; font-size: 0.78rem; text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }}
+        .stat-num {{ font-size: 2rem; font-weight: 800; margin-top: 4px; }}
+        .num-green {{ color: #00e59b; }}
+        .num-blue {{ color: #38bdf8; }}
+        .num-orange {{ color: #f59e0b; }}
+
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+        th {{ padding: 10px; font-size: 0.8rem; text-transform: uppercase; color: #94a3b8; border-bottom: 2px solid #334155; letter-spacing: 0.5px; }}
+        .footer {{ margin-top: 18px; font-size: 0.8rem; color: #64748b; text-align: center; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1><span class="badge">LIVE</span> Statistiche e Monitor Spettatori</h1>
+        
+        <div class="grid-stats">
+            <div class="stat-box green">
+                <div class="stat-label">In Riproduzione ORA</div>
+                <div class="stat-num num-green">{stats['total_viewers_live']}</div>
+            </div>
+            <div class="stat-box blue">
+                <div class="stat-label">Spettatori Totali Unici</div>
+                <div class="stat-num num-blue">{stats['total_unique_viewers']}</div>
+            </div>
+            <div class="stat-box orange">
+                <div class="stat-label">Click Totali su Play</div>
+                <div class="stat-num num-orange">{stats['total_play_clicks']}</div>
+            </div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th style="text-align:left;">Evento / Canale</th>
+                    <th style="text-align:center;">In Live Ora</th>
+                    <th style="text-align:center;">Totali Unici</th>
+                    <th style="text-align:center;">Click Play</th>
+                </tr>
+            </thead>
+            <tbody>
+                {ev_html}
+            </tbody>
+        </table>
+        
+        <div class="footer">Aggiornamento automatico ogni 5 secondi &bull; Rilevamento in tempo reale tramite Script2 API</div>
+    </div>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
+
 
 if not os.environ.get("SCRIPT2_NO_WARMUP"):
     threading.Thread(target=_warmup_browser_context, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
+
+

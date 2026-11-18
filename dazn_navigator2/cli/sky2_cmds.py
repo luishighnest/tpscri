@@ -265,36 +265,35 @@ def sync_sky2_site():
 
             key_val = ""
             mpd_val = ""
-            for j in range(i+1, min(i+5, len(lines))):
+            for j in range(i+1, min(i+8, len(lines))):
                 if "license_key=" in lines[j]:
                     key_val = lines[j].split("license_key=")[-1].strip()
-                elif lines[j].startswith("http"):
+                elif lines[j].strip() and not lines[j].lstrip().startswith("#"):
                     mpd_val = lines[j].strip()
                     break
 
-            if mpd_val:
-                group = determine_group(name, m3u_group)
-                logo = get_logo(name, raw_logo)
-                
-                entry = {
-                    "key": key_val,
-                    "name": name,
-                    "logo": logo,
-                    "mpd": mpd_val
-                }
-                
-                if group not in output_data:
-                    output_data[group] = {}
-                
-                name_key = name.lower().strip()
-                existing_entry = output_data[group].get(name_key)
-                if existing_entry is None:
+            # Non escludere i canali non-mpd: si include ogni EXTINF, anche senza URL.
+            group = determine_group(name, m3u_group)
+            logo = get_logo(name, raw_logo)
+
+            entry = {
+                "key": key_val,
+                "name": name,
+                "logo": logo,
+                "mpd": mpd_val
+            }
+
+            if group not in output_data:
+                output_data[group] = {}
+
+            name_key = name.lower().strip()
+            existing_entry = output_data[group].get(name_key)
+            if existing_entry is None:
+                output_data[group][name_key] = entry
+            else:
+                if _extract_exp(mpd_val) > _extract_exp(existing_entry["mpd"]):
                     output_data[group][name_key] = entry
-                else:
-                    # Mantieni l'entry con scadenza più lontana
-                    if _extract_exp(mpd_val) > _extract_exp(existing_entry["mpd"]):
-                        output_data[group][name_key] = entry
-                m3u_parsed_counts += 1
+            m3u_parsed_counts += 1
 
     # Converti i dict di dedup in liste
     output_data = {cat: list(entries.values()) for cat, entries in output_data.items()}
